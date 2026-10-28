@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pareto Ranker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --emerald: #0B6E4F;
+    --emerald-dark: #084C37;
+    --black: #111111;
+    --grey: #6B7280;
+    --grey-light: #F4F4F3;
+    --border: #E4E4E2;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: var(--black); font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  .mono { font-family: 'Cascadia Code', monospace; }
+
+  /* Top bar */
+  .topbar {
+    position: sticky; top: 0; z-index: 10; background: #000;
+    display: flex; align-items: center; justify-content: flex-start; padding: 20px 32px;
+  }
+  .topbar .badge {
+    font-family: 'Cascadia Code', monospace; font-weight: 700; font-size: 21px; letter-spacing: 0.07em;
+    text-transform: uppercase; color: #fff; -webkit-text-stroke: 0.4px #fff;
+  }
+
+  /* Hero */
+  .hero { text-align: center; padding: 96px 24px 80px; max-width: 780px; margin: 0 auto; }
+  .hero h1 {
+    font-family: 'Cascadia Code', monospace; font-weight: 700; text-transform: uppercase;
+    font-size: 52px; line-height: 1.08; letter-spacing: -0.01em; margin: 0 0 22px;
+    color: var(--black);
+  }
+  .hero h1 span { color: var(--emerald); display: block; }
+  .hero p { font-size: 17px; line-height: 1.6; color: var(--grey); margin: 0 auto 34px; max-width: 560px; }
+  .hero .buttons { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn-primary { background: var(--emerald-dark); color: #fff; padding: 13px 26px; border-radius: 5px; font-weight: 600; text-decoration: none; font-size: 15px; }
+  .btn-secondary { background: #fff; color: var(--black); padding: 13px 26px; border-radius: 5px; font-weight: 600; text-decoration: none; font-size: 15px; border: 1.5px solid var(--border); }
+
+  /* How it works: five numbered step cards */
+  .how { background: var(--grey-light); padding: 70px 24px; }
+  .how h2 { font-family: 'Cascadia Code', monospace; font-weight: 700; text-transform: uppercase; font-size: 30px; text-align: center; margin: 0 0 44px; }
+  .steps-grid { max-width: 1180px; margin: 0 auto; display: grid; grid-template-columns: repeat(5, 1fr); gap: 20px; }
+  .step-card { position: relative; background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 28px 20px 24px; text-align: left; }
+  .step-num {
+    position: absolute; top: 16px; right: 16px; width: 28px; height: 28px; border-radius: 50%;
+    background: var(--emerald-dark); color: #fff; display: flex; align-items: center; justify-content: center;
+    font-family: 'Cascadia Code', monospace; font-weight: 700; font-size: 13px;
+  }
+  .step-icon { width: 40px; height: 40px; margin-bottom: 18px; }
+  .step-card h3 { font-family: 'Cascadia Code', monospace; font-weight: 700; font-size: 14px; text-transform: uppercase; margin: 0 0 10px; letter-spacing: 0.01em; }
+  .step-card p { font-size: 13.5px; color: var(--grey); line-height: 1.55; margin: 0; }
+  /* Narrower screens: two cards per row, then one per row on phones */
+  @media (max-width: 1000px) { .steps-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .steps-grid { grid-template-columns: 1fr; } }
+
+  /* Privacy note */
+  .notes { background: #fff; border-top: 1px solid var(--border); padding: 28px 24px; }
+  .notes .privacy { max-width: 720px; margin: 0 auto; font-size: 13.5px; line-height: 1.6; color: var(--grey); text-align: center; }
+  .notes .privacy strong { color: #333; }
+
+  /* Footer */
+  footer { background: var(--black); color: #ddd; padding: 44px 40px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+  footer .title { font-family: 'Cascadia Code', monospace; font-weight: 700; text-transform: uppercase; color: #fff; font-size: 15px; }
+  footer .contact { display: flex; gap: 22px; font-size: 13.5px; }
+  footer .contact a { color: #ccc; text-decoration: none; }
+  footer .contact a:hover { color: var(--emerald); }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="badge">Pareto Ranker</div>
+  </div>
+
+  <section class="hero">
+    <h1>FIND THE DESIGN<span>THAT FITS YOUR PRIORITIES</span></h1>
+    <p>Upload a set of Pareto-optimal solutions from your optimization, weigh your objectives and see which solution comes out on top, and exactly what it involves.</p>
+    <div class="buttons">
+      <a class="btn-primary" href="tool.html">Launch the tool</a>
+      <a class="btn-secondary" href="tool.html?demo=1">Try the example</a>
+      <a class="btn-secondary" href="#how">See how it works</a>
+    </div>
+  </section>
+
+  <section class="how" id="how">
+    <h2>How it works</h2>
+    <div class="steps-grid">
+      <div class="step-card">
+        <div class="step-num">1</div>
+        <svg class="step-icon" viewBox="0 0 40 40" fill="none"><rect x="5" y="8" width="30" height="24" rx="2" stroke="#0B6E4F" stroke-width="2"/><line x1="5" y1="16" x2="35" y2="16" stroke="#0B6E4F" stroke-width="2"/><line x1="15" y1="16" x2="15" y2="32" stroke="#0B6E4F" stroke-width="2"/><line x1="25" y1="16" x2="25" y2="32" stroke="#0B6E4F" stroke-width="2"/></svg>
+        <h3>Prepare your spreadsheet</h3>
+        <p>Download the template or the example, and fill it in with your Pareto-optimal solutions, one per row. Add each column's unit in parentheses after its name.</p>
+      </div>
+      <div class="step-card">
+        <div class="step-num">2</div>
+        <svg class="step-icon" viewBox="0 0 40 40" fill="none"><rect x="6" y="26" width="28" height="8" rx="2" stroke="#0B6E4F" stroke-width="2"/><path d="M20 22V6M20 6L13 13M20 6L27 13" stroke="#0B6E4F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <h3>Upload your spreadsheet</h3>
+        <p>Upload it to the tool, then mark which columns are objectives (minimize or maximize) and which are design parameters.</p>
+      </div>
+      <div class="step-card">
+        <div class="step-num">3</div>
+        <svg class="step-icon" viewBox="0 0 40 40" fill="none"><line x1="8" y1="10" x2="8" y2="30" stroke="#0B6E4F" stroke-width="2"/><circle cx="8" cy="16" r="3.5" fill="#0B6E4F"/><line x1="20" y1="10" x2="20" y2="30" stroke="#0B6E4F" stroke-width="2"/><circle cx="20" cy="24" r="3.5" fill="#0B6E4F"/><line x1="32" y1="10" x2="32" y2="30" stroke="#0B6E4F" stroke-width="2"/><circle cx="32" cy="12" r="3.5" fill="#0B6E4F"/></svg>
+        <h3>Set your priorities</h3>
+        <p>Adjust simple sliders to say how much each objective matters to you.</p>
+      </div>
+      <div class="step-card">
+        <div class="step-num">4</div>
+        <svg class="step-icon" viewBox="0 0 40 40" fill="none"><line x1="6" y1="34" x2="34" y2="34" stroke="#0B6E4F" stroke-width="2"/><line x1="6" y1="34" x2="6" y2="8" stroke="#0B6E4F" stroke-width="2"/><circle cx="12" cy="26" r="2.5" fill="#0B6E4F"/><circle cx="20" cy="16" r="2.5" fill="#0B6E4F"/><circle cx="28" cy="21" r="2.5" fill="#0B6E4F"/></svg>
+        <h3>Explore the results</h3>
+        <p>See the ranked solutions, the changes each one involves, and charts that show the trade-offs.</p>
+      </div>
+      <div class="step-card">
+        <div class="step-num">5</div>
+        <svg class="step-icon" viewBox="0 0 40 40" fill="none"><rect x="6" y="26" width="28" height="8" rx="2" stroke="#0B6E4F" stroke-width="2"/><path d="M20 6V22M20 22L13 15M20 22L27 15" stroke="#0B6E4F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <h3>Download your results</h3>
+        <p>Save any of the charts as a PNG or SVG image, the ranked solutions as an Excel file, and the scenario comparison as an Excel file or image.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="notes">
+    <p class="privacy"><strong>Your data stays private:</strong> This tool does all of its work directly inside your web browser. That means your spreadsheet is never sent to, or stored on, any outside server. Closing the page clears everything.</p>
+  </section>
+
+  <footer id="contact">
+    <div class="title">Pareto Ranker</div>
+    <div class="contact">
+      <a href="mailto:gaguilar.dag@gmail.com">gaguilar.dag@gmail.com</a>
+      <a href="https://www.linkedin.com/in/gabriela-aguilar-giron-6aa726208" target="_blank" rel="noopener noreferrer">LinkedIn</a>
+    </div>
+  </footer>
+
+</body>
+</html>

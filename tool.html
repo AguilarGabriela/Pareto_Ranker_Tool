@@ -1,0 +1,2764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pareto Ranker | Tool</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: #FFFFFF; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect, useRef } = React;
+
+
+const BG = "#FFFFFF";
+const PANEL = "#F6F6F5";
+const PANEL_LIGHT = "#FFFFFF";
+const BORDER = "#E4E4E2";
+const TEXT = "#111111";
+const MUTED = "#6B7280";
+const EMERALD = "#0B6E4F";
+const EMERALD_DARK = "#084C37";
+
+const TOP_COLORS = ["#0B6E4F", "#2A6F97", "#B5651D", "#7B4F9E", "#B0413E", "#4C6444", "#A6763D", "#3A5A78"];
+// Lighter scenario colors, chosen so black text on them is easy to read (contrast of at least 5 to 1)
+const SCENARIO_COLORS = ["#4C8CA2", "#CF8F4D", "#9977B4", "#5A9C83", "#CD708E", "#748EA8", "#AD8E69", "#917C9D"];
+
+function lerpColor(a, b, t) {
+  const pa = a.match(/\w\w/g).map((h) => parseInt(h, 16));
+  const pb = b.match(/\w\w/g).map((h) => parseInt(h, 16));
+  const p = pa.map((v, i) => Math.round(v + (pb[i] - v) * t));
+  return `rgb(${p[0]},${p[1]},${p[2]})`;
+}
+
+function fmtNum(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "–";
+  if (typeof v !== "number") return String(v);
+  if (Math.abs(v) >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (Number.isInteger(v)) return String(v);
+  return v.toLocaleString(undefined, { maximumFractionDigits: 3 });
+}
+
+// Short number format for chart labels only: values of a million or more become 1.63M, 2.4B, 1.63T.
+// Smaller values are shown in full. Tables, hover boxes and Excel files keep the exact numbers.
+function fmtShort(v) {
+  if (typeof v !== "number" || !Number.isFinite(v)) return fmtNum(v);
+  const units = [[1e6, "M"], [1e9, "B"], [1e12, "T"]];
+  if (Math.abs(v) < 1e6) return fmtNum(v);
+  for (let i = 0; i < units.length; i++) {
+    const [d, u] = units[i];
+    const shown = parseFloat((v / d).toPrecision(3));
+    if (Math.abs(shown) < 1000 || i === units.length - 1) return shown.toLocaleString(undefined, { maximumFractionDigits: 2 }) + u;
+  }
+  return fmtNum(v);
+}
+
+// Wraps a label into up to 2 lines of roughly maxCharsPerLine each, truncating with an ellipsis beyond that
+function wrapTwoLines(text, maxCharsPerLine) {
+  if (text.length <= maxCharsPerLine) return [text];
+  const words = text.split(" ");
+  let line1 = "", line2 = "";
+  for (const w of words) {
+    const tryLine1 = (line1 + " " + w).trim();
+    const tryLine2 = (line2 + " " + w).trim();
+    if (!line2 && tryLine1.length <= maxCharsPerLine) {
+      line1 = tryLine1;
+    } else if (tryLine2.length <= maxCharsPerLine) {
+      line2 = tryLine2;
+    } else {
+      line2 = tryLine2;
+      break;
+    }
+  }
+  if (!line1) { line1 = text.slice(0, maxCharsPerLine); line2 = text.slice(maxCharsPerLine); }
+  if (line2.length > maxCharsPerLine) line2 = line2.slice(0, maxCharsPerLine - 1) + "…";
+  return line2 ? [line1, line2] : [line1];
+}
+
+function niceNumber(range, round) {
+  if (range === 0) return 1;
+  const exponent = Math.floor(Math.log10(range));
+  const fraction = range / Math.pow(10, exponent);
+  let niceFraction;
+  if (round) {
+    if (fraction < 1.5) niceFraction = 1;
+    else if (fraction < 3) niceFraction = 2;
+    else if (fraction < 7) niceFraction = 5;
+    else niceFraction = 10;
+  } else {
+    if (fraction <= 1) niceFraction = 1;
+    else if (fraction <= 2) niceFraction = 2;
+    else if (fraction <= 5) niceFraction = 5;
+    else niceFraction = 10;
+  }
+  return niceFraction * Math.pow(10, exponent);
+}
+
+// Produces "nice" round ticks that tightly cover the data range (won't overshoot far past the real max/min)
+function niceTicksN(dataMin, dataMax, targetCount) {
+  if (dataMin === dataMax) { dataMin -= 1; dataMax += 1; }
+  targetCount = Math.max(2, Math.round(targetCount));
+  const range = niceNumber(dataMax - dataMin, false);
+  const step = niceNumber(range / (targetCount - 1), true);
+  const niceMin = Math.floor(dataMin / step) * step;
+  const niceMax = Math.ceil(dataMax / step) * step;
+  const ticks = [];
+  for (let v = niceMin; v <= niceMax + step * 0.5; v += step) {
+    ticks.push(Math.round((v + Number.EPSILON) * 1e9) / 1e9);
+  }
+  return { min: niceMin, max: niceMax, step, ticks };
+}
+
+// Files with more designs than this start with "Live updates" switched off, so moving a slider doesn't lag.
+// Placeholder value: adjust after testing with large files.
+const LIVE_UPDATE_ROW_LIMIT = 2000;
+
+// ---------- Chart downloads (PNG / SVG) ----------
+// Charts are saved 6.5 inches wide: the text width of a letter-size page with 1-inch margins.
+// 6.5 in x 96 px per inch = 624 px; the chart itself is drawn 600 px wide with a 12 px white margin.
+const EXPORT_W = 600;
+const EXPORT_PAD = 12;
+const EXPORT_PNG_SCALE = 3; // 3x pixels = about 300 pixels per inch when printed at 6.5 in
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+// Writes the resolution into the PNG (a "pHYs" block) so programs like Word place it at the intended size
+async function setPngDpi(blob, dpi) {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const ppm = Math.round(dpi / 0.0254);
+  const chunk = new Uint8Array(21);
+  const dv = new DataView(chunk.buffer);
+  dv.setUint32(0, 9);
+  chunk.set([0x70, 0x48, 0x59, 0x73], 4); // "pHYs"
+  dv.setUint32(8, ppm);
+  dv.setUint32(12, ppm);
+  chunk[16] = 1; // unit: meters
+  dv.setUint32(17, crc32(chunk.subarray(4, 17)));
+  const insertAt = 33; // right after the PNG signature (8 bytes) and the IHDR block (25 bytes)
+  const out = new Uint8Array(buf.length + 21);
+  out.set(buf.subarray(0, insertAt), 0);
+  out.set(chunk, insertAt);
+  out.set(buf.subarray(insertAt), insertAt + 21);
+  return new Blob([out], { type: "image/png" });
+}
+
+// The chart font (Cascadia Code) comes from Google Fonts. An SVG drawn into a PNG can't download fonts,
+// so for PNGs the font file is embedded inside the picture. If that fails, the PNG uses a similar font.
+let fontCssPromise = null;
+function getEmbeddedFontCss() {
+  if (!fontCssPromise) {
+    fontCssPromise = (async () => {
+      try {
+        const cssText = await (await fetch("https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600;700&display=swap")).text();
+        const blocks = cssText.match(/@font-face\s*{[^}]*}/g) || [];
+        const latin = blocks.filter((b) => /unicode-range:[^;]*U\+0000-00FF/i.test(b));
+        const out = [];
+        for (const b of latin) {
+          const m = b.match(/url\((['"]?)([^'")]+)\1\)/);
+          if (!m) continue;
+          const fontBlob = await (await fetch(m[2])).blob();
+          const dataUrl = await new Promise((res, rej) => {
+            const r = new FileReader();
+            r.onload = () => res(r.result);
+            r.onerror = rej;
+            r.readAsDataURL(fontBlob);
+          });
+          out.push(b.replace(m[0], `url(${dataUrl})`));
+        }
+        return out.join("\n");
+      } catch (e) {
+        return "";
+      }
+    })();
+  }
+  return fontCssPromise;
+}
+
+function slugify(text) {
+  return String(text || "chart").replace(/[^A-Za-z0-9_\-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80) || "chart";
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// Height taken by the title and legend at the top of a downloaded chart (same layout as buildExportSvg)
+function exportHeaderHeight(meta, totalW) {
+  let y = 0;
+  if (meta && meta.title) y += 24;
+  if (meta && meta.legend && meta.legend.length) {
+    let x = EXPORT_PAD;
+    meta.legend.forEach((item) => {
+      const colors = item.colors || [item.color];
+      const w = colors.length * 13 + 4 + item.label.length * 6.2 + 16;
+      if (x + w > totalW - EXPORT_PAD && x > EXPORT_PAD) { x = EXPORT_PAD; y += 18; }
+      x += w;
+    });
+    y += 18 + 6;
+  }
+  return y;
+}
+
+// Download size from inches: the whole image (chart, title, legend and white margin) is exactly widthIn x heightIn.
+// heightIn is optional; without it the chart keeps its on-screen height.
+function exportSize(meta, widthIn, heightIn) {
+  const totalW = Math.round(widthIn * 96);
+  const out = { ...meta, chartW: totalW - EXPORT_PAD * 2 };
+  if (heightIn) {
+    out.totalPx = Math.round(heightIn * 96);
+    out.chartH = Math.max(80, out.totalPx - EXPORT_PAD * 2 - exportHeaderHeight(meta, totalW));
+  }
+  return out;
+}
+
+// Builds a standalone SVG (white background, optional title and legend) around a chart's SVG element
+function buildExportSvg(svgEl, meta, fontCss) {
+  const NS = "http://www.w3.org/2000/svg";
+  const SANS = "-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif";
+  const vb = svgEl.viewBox && svgEl.viewBox.baseVal && svgEl.viewBox.baseVal.width ? svgEl.viewBox.baseVal : { width: svgEl.clientWidth, height: svgEl.clientHeight };
+  let bbox = { x: 0, y: 0, width: vb.width, height: vb.height };
+  try { bbox = svgEl.getBBox(); } catch (e) {}
+  // Include anything drawn slightly outside the chart's box (e.g. axis labels)
+  const minX = Math.min(0, bbox.x), minY = Math.min(0, bbox.y);
+  const maxX = Math.max(vb.width, bbox.x + bbox.width), maxY = Math.max(vb.height, bbox.y + bbox.height);
+  const cw = maxX - minX, ch = maxY - minY;
+  const EW = (meta && meta.chartW) || EXPORT_W; // chart width for this download (6.5 in by default)
+  let scale = Math.min(1, EW / cw);
+  const totalW = EW + EXPORT_PAD * 2;
+
+  const root = document.createElementNS(NS, "svg");
+  root.setAttribute("xmlns", NS);
+  root.setAttribute("font-family", SANS);
+  if (fontCss) {
+    const defs = document.createElementNS(NS, "defs");
+    const style = document.createElementNS(NS, "style");
+    style.textContent = fontCss;
+    defs.appendChild(style);
+    root.appendChild(defs);
+  }
+  const bg = document.createElementNS(NS, "rect");
+  bg.setAttribute("x", 0); bg.setAttribute("y", 0); bg.setAttribute("width", totalW); bg.setAttribute("fill", "#FFFFFF");
+  root.appendChild(bg);
+
+  let y = EXPORT_PAD;
+  if (meta && meta.title) {
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", EXPORT_PAD); t.setAttribute("y", y + 13);
+    t.setAttribute("font-size", "13"); t.setAttribute("font-weight", "700"); t.setAttribute("fill", "#111111");
+    t.textContent = meta.title;
+    root.appendChild(t);
+    y += 24;
+  }
+  if (meta && meta.legend && meta.legend.length) {
+    let x = EXPORT_PAD;
+    const rowH = 18;
+    meta.legend.forEach((item) => {
+      const colors = item.colors || [item.color];
+      const w = colors.length * 13 + 4 + item.label.length * 6.2 + 16;
+      if (x + w > totalW - EXPORT_PAD && x > EXPORT_PAD) { x = EXPORT_PAD; y += rowH; }
+      colors.forEach((c, i) => {
+        const r = document.createElementNS(NS, "rect");
+        r.setAttribute("x", x + i * 13); r.setAttribute("y", y + 2); r.setAttribute("width", 10); r.setAttribute("height", 10); r.setAttribute("rx", 2);
+        r.setAttribute("fill", c);
+        root.appendChild(r);
+      });
+      const t = document.createElementNS(NS, "text");
+      t.setAttribute("x", x + colors.length * 13 + 4); t.setAttribute("y", y + 11);
+      t.setAttribute("font-size", "11"); t.setAttribute("fill", "#111111");
+      t.textContent = item.label;
+      root.appendChild(t);
+      x += w;
+    });
+    y += rowH + 6;
+  }
+
+  // Custom height: make sure the chart fits the space left under the title and legend
+  if (meta && meta.totalPx) scale = Math.min(scale, Math.max(0.1, (meta.totalPx - y - EXPORT_PAD) / ch));
+
+  // Copy the chart, writing each text's font directly on it (page styles don't travel with the file)
+  const clone = svgEl.cloneNode(true);
+  const origTexts = svgEl.querySelectorAll("text");
+  const cloneTexts = clone.querySelectorAll("text");
+  origTexts.forEach((t, i) => {
+    const cs = window.getComputedStyle(t);
+    cloneTexts[i].setAttribute("font-family", cs.fontFamily);
+    cloneTexts[i].removeAttribute("class");
+  });
+  clone.querySelectorAll("title").forEach((el) => el.remove());
+  clone.querySelectorAll("[style]").forEach((el) => el.removeAttribute("style"));
+  const g = document.createElementNS(NS, "g");
+  g.setAttribute("transform", `translate(${EXPORT_PAD}, ${y}) scale(${scale}) translate(${-minX}, ${-minY})`);
+  while (clone.firstChild) g.appendChild(clone.firstChild);
+  root.appendChild(g);
+
+  const totalH = meta && meta.totalPx ? meta.totalPx : Math.ceil(y + ch * scale + EXPORT_PAD);
+  bg.setAttribute("height", totalH);
+  root.setAttribute("width", totalW);
+  root.setAttribute("height", totalH);
+  root.setAttribute("viewBox", `0 0 ${totalW} ${totalH}`);
+  return { text: new XMLSerializer().serializeToString(root), width: totalW, height: totalH };
+}
+
+async function exportSvgElement(svgEl, meta, format) {
+  const filenameBase = slugify(meta && meta.filename);
+  if (format === "svg") {
+    const { text } = buildExportSvg(svgEl, meta, "");
+    downloadBlob(new Blob([text], { type: "image/svg+xml" }), filenameBase + ".svg");
+    return;
+  }
+  const fontCss = await getEmbeddedFontCss();
+  const { text, width, height } = buildExportSvg(svgEl, meta, fontCss);
+  const img = new Image();
+  img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(text);
+  await img.decode();
+  const canvas = document.createElement("canvas");
+  canvas.width = width * EXPORT_PNG_SCALE;
+  canvas.height = height * EXPORT_PNG_SCALE;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(EXPORT_PNG_SCALE, EXPORT_PNG_SCALE);
+  ctx.drawImage(img, 0, 0, width, height);
+  const raw = await new Promise((res) => canvas.toBlob(res, "image/png"));
+  const png = await setPngDpi(raw, 96 * EXPORT_PNG_SCALE);
+  downloadBlob(png, filenameBase + ".png");
+}
+
+// Width of a piece of text in pixels, in a given CSS font (used to fit numbers in charts)
+const _measureCtx = typeof document !== "undefined" ? document.createElement("canvas").getContext("2d") : null;
+function textWidth(text, font) {
+  if (!_measureCtx) return String(text).length * 7;
+  _measureCtx.font = font;
+  return _measureCtx.measureText(String(text)).width;
+}
+// White text on dark bars, dark text on light bars
+function textOnColor(hex) {
+  const m = String(hex).match(/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+  if (!m) return "#FFFFFF";
+  const [r, g, b] = [m[1], m[2], m[3]].map((h) => parseInt(h, 16) / 255).map((c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)));
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  // Pick whichever of white / near-black gives more contrast
+  const contrastWhite = 1.05 / (lum + 0.05);
+  const contrastDark = (lum + 0.05) / (0.0137 + 0.05);
+  return contrastWhite >= contrastDark ? "#FFFFFF" : "#111111";
+}
+
+function fmtWeight(v) {
+  const r = Math.round((Number(v) || 0) * 10) / 10;
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
+}
+
+// ---------- Demo mode (tool.html?demo=1) ----------
+// Loads sample-data.xlsx from the same folder as this page and applies the settings the file itself can't store.
+const DEMO_FILE = "sample-data.xlsx";
+const DEMO = {
+  // The example file holds column names only, so the tool sets each column's role and objective direction here.
+  // Columns not listed are numeric and become design parameters.
+  roles: {
+    "Run": "ignore",
+    "Winter TTF (h)": "ignore",
+    "Summer TTF (h)": "ignore",
+    "Net lifecycle carbon (kgCO₂eq)": "min",
+    "Net present cost (CAD)": "min",
+    "Resilience TTF (h)": "max",
+  },
+  // Weights in the order: carbon, cost, resilience
+  scenarios: [
+    { name: "Balanced", w: [100 / 3, 100 / 3, 100 / 3] },
+    { name: "Carbon priority", w: [80, 10, 10] },
+    { name: "Cost priority", w: [10, 80, 10] },
+    { name: "Resilience priority", w: [10, 10, 80] },
+  ],
+  objectiveOrder: ["Net lifecycle carbon (kgCO₂eq)", "Net present cost (CAD)", "Resilience TTF (h)"],
+};
+
+const ROLE_LABELS = {
+  ignore: "Ignore",
+  variable: "Design parameter",
+  min: "Objective (minimize)",
+  max: "Objective (maximize)",
+};
+
+// Measures the width available to a chart and passes it in, so the chart is drawn at its real size
+// (text keeps its size instead of being stretched with the card).
+function MeasuredWidth({ children }) {
+  const ref = useRef(null);
+  const [w, setW] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const update = () => setW(Math.floor(el.getBoundingClientRect().width));
+    update();
+    let ro = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(update);
+      ro.observe(el);
+    } else {
+      window.addEventListener("resize", update);
+    }
+    return () => { if (ro) ro.disconnect(); else window.removeEventListener("resize", update); };
+  }, []);
+  return <div ref={ref} style={{ width: "100%" }}>{w > 0 ? children(w) : null}</div>;
+}
+
+function ParetoRanker() {
+  const [fileName, setFileName] = useState(null);
+  const [rows, setRows] = useState(null);
+  const [columns, setColumns] = useState([]);
+  const [roles, setRoles] = useState({});
+  const [weights, setWeights] = useState({});
+  const [error, setError] = useState(null);
+  const [demoMode, setDemoMode] = useState(false);
+  const demoPendingRef = useRef(false);
+  const [xCol, setXCol] = useState(null);
+  const [yCol, setYCol] = useState(null);
+  const [showVars, setShowVars] = useState(true);
+  const [hoverPoint, setHoverPoint] = useState(null);
+  const [hoverScenPoint, setHoverScenPoint] = useState(null);
+  const [hoverLine, setHoverLine] = useState(null);
+  const [chartView, setChartView] = useState("scatter"); // "scatter" | "parallel" | "histograms"
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [displayNames, setDisplayNames] = useState({});
+  const [topN, setTopN] = useState(5);
+  const [topNDraft, setTopNDraft] = useState("5");
+  const [autoDetected, setAutoDetected] = useState(false);
+  const [draftWeights, setDraftWeights] = useState({});
+  const [locked, setLocked] = useState({});
+  const [scenarios, setScenarios] = useState([]);
+  const [showSaveScenario, setShowSaveScenario] = useState(false);
+  const [newScenarioName, setNewScenarioName] = useState("");
+  const [showTabSave, setShowTabSave] = useState(false);
+  const [liveUpdates, setLiveUpdates] = useState(true);
+  const [weightTyping, setWeightTyping] = useState(null); // { col, text } while a weight box is being typed in
+  const [autoLiveOff, setAutoLiveOff] = useState(false); // true when the tool switched live updates off because the file is large
+  // Variable coordinates tab: user-made groups of variables, each drawn as its own plot
+  const [varGroups, setVarGroups] = useState([]); // [{ id, name, vars: [colName, ...] }]
+  const [showAllVarPlot, setShowAllVarPlot] = useState(true);
+  const [allPlotExcluded, setAllPlotExcluded] = useState([]); // variables unticked from the "All variables" plot
+  const [allPlotPickerOpen, setAllPlotPickerOpen] = useState(false);
+  const [groupEditor, setGroupEditor] = useState(null); // null, or { id (null = new group), name, vars }
+  const [groupsPanelOpen, setGroupsPanelOpen] = useState(true);
+  const [hoverVarLine, setHoverVarLine] = useState(null); // { plotKey, result }
+  const [hoverScenLine, setHoverScenLine] = useState(null); // info about the scenario line under the mouse
+  const [hoverScenVarLine, setHoverScenVarLine] = useState(null); // same, for the scenario variable plots
+  // Parallel coordinates (objectives + variables): columns the user unticked, and whether the checkbox list is open
+  const [pcHidden, setPcHidden] = useState([]);
+  const [pcPanelOpen, setPcPanelOpen] = useState(true);
+  // Download width for the parallel coordinates plots: "6.5" (portrait page), "9" (landscape page) or "custom"
+  const [pcSizeMode, setPcSizeMode] = useState("6.5");
+  const [pcCustomIn, setPcCustomIn] = useState("12");
+  const [pcCustomH, setPcCustomH] = useState("5"); // custom height in inches (parallel coordinates)
+  // Download size for the 2D scatter plots (tab and Scenarios share it): "standard" (as before) or "custom"
+  const [scatSizeMode, setScatSizeMode] = useState("standard");
+  const [scatCustomW, setScatCustomW] = useState("6.5");
+  const [scatCustomH, setScatCustomH] = useState("4");
+  // Downloads: the chart being saved is redrawn 600 px wide for a moment, captured, then drawn normally again
+  const [exportTarget, setExportTarget] = useState(null);
+  const exportJobRef = useRef(null);
+  const [exportError, setExportError] = useState("");
+  const [tabScenarioName, setTabScenarioName] = useState("");
+  const weightDebounceRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setError(null);
+    // A file the user uploads replaces the sample data
+    setDemoMode(false);
+    demoPendingRef.current = false;
+    const reader = new FileReader();
+    reader.onload = (evt) => loadWorkbook(evt.target.result, file.name);
+    reader.readAsArrayBuffer(file);
+  }
+
+  // Reads a spreadsheet (as an ArrayBuffer) and sets up columns, labels and data. Used by uploads and by the demo.
+  function loadWorkbook(buffer, name, presetRoles) {
+      try {
+        const data = new Uint8Array(buffer);
+        const wb = XLSX.read(data, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+        if (!raw.length) {
+          setError("This file doesn't seem to have any rows in it.");
+          return;
+        }
+
+        // The first row holds the column names; roles and objective directions are set in the tool (step 3)
+        const headerRow = raw[0] || [];
+        const dataStart = 1;
+
+        const cols = headerRow.map((h, i) => (h === null || h === "" ? `Column ${i + 1}` : String(h)));
+        const dataRows = raw.slice(dataStart).filter((r) => r && r.some((v) => v !== null && v !== ""));
+        const json = dataRows.map((r) => {
+          const obj = {};
+          cols.forEach((c, i) => { obj[c] = r[i] === undefined ? null : r[i]; });
+          return obj;
+        });
+
+        if (!json.length) {
+          setError("This file doesn't seem to have any data rows in it.");
+          return;
+        }
+
+        const initRoles = {};
+        cols.forEach((c) => {
+          if (presetRoles && presetRoles[c]) {
+            initRoles[c] = presetRoles[c];
+          } else {
+            const isNumeric = json.every((r) => r[c] === null || typeof r[c] === "number");
+            initRoles[c] = isNumeric ? "variable" : "ignore";
+          }
+        });
+
+        setColumns(cols);
+        setRoles(initRoles);
+        setRows(json);
+        setWeights({});
+        setXCol(null);
+        setYCol(null);
+        setFileName(name);
+        setChartView("scatter");
+        const initNames = {};
+        cols.forEach((c) => { initNames[c] = c; });
+        setDisplayNames(initNames);
+        setAutoDetected(false);
+        setLocked({});
+        setScenarios([]);
+        setShowSaveScenario(false);
+        setShowTabSave(false);
+        setTabScenarioName("");
+        setVarGroups([]);
+        setGroupEditor(null);
+        setShowAllVarPlot(true);
+        setAllPlotExcluded([]);
+        setAllPlotPickerOpen(false);
+        setPcHidden([]);
+        setPcPanelOpen(true);
+        const isLarge = json.length > LIVE_UPDATE_ROW_LIMIT;
+        setLiveUpdates(!isLarge);
+        setAutoLiveOff(isLarge);
+      } catch (err) {
+        setError("Couldn't read that file. Make sure it's a .xlsx or .xls spreadsheet.");
+      }
+  }
+
+  // Example: loads sample-data.xlsx into the tool (used by the "Open example in the tool" button and by tool.html?demo=1)
+  function openExample() {
+    setError(null);
+    fetch(DEMO_FILE)
+      .then((r) => { if (!r.ok) throw new Error("not found"); return r.arrayBuffer(); })
+      .then((buf) => {
+        demoPendingRef.current = true;
+        setDemoMode(true);
+        loadWorkbook(buf, DEMO_FILE, DEMO.roles);
+      })
+      .catch(() => {
+        setError("The example couldn't be loaded. It only works on the live website, not when the page is opened directly from your computer. You can still upload your own file.");
+      });
+  }
+
+  useEffect(() => {
+    let wantsDemo = false;
+    try { wantsDemo = new URLSearchParams(window.location.search).get("demo") === "1"; } catch (e) {}
+    if (wantsDemo) openExample();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const objectives = useMemo(
+    () => columns.filter((c) => roles[c] === "min" || roles[c] === "max"),
+    [columns, roles]
+  );
+  const variables = useMemo(
+    () => columns.filter((c) => roles[c] === "variable"),
+    [columns, roles]
+  );
+  const objKey = objectives.join("|");
+
+  useEffect(() => {
+    if (!objectives.length) return;
+    setWeights((prev) => {
+      const next = {};
+      objectives.forEach((o) => {
+        next[o] = prev[o] !== undefined ? prev[o] : 100 / objectives.length;
+      });
+      return next;
+    });
+    setXCol((prev) => (prev && objectives.includes(prev) ? prev : objectives[0] || null));
+    setYCol((prev) =>
+      prev && objectives.includes(prev) ? prev : objectives[1] || objectives[0] || null
+    );
+    setScenXCol((prev) => (prev && objectives.includes(prev) ? prev : objectives[0] || null));
+    setScenYCol((prev) =>
+      prev && objectives.includes(prev) ? prev : objectives[1] || objectives[0] || null
+    );
+    setScenarios([]);
+    setShowSaveScenario(false);
+    setShowTabSave(false);
+    setTabScenarioName("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objKey]);
+
+  // Demo: once the sample file is loaded, set objective directions, variable groups and the ready-made scenarios
+  useEffect(() => {
+    if (!demoPendingRef.current || !rows || !objectives.length) return;
+    demoPendingRef.current = false;
+    if (DEMO.objectiveOrder.every((o) => objectives.includes(o))) {
+      setScenarios(DEMO.scenarios.map((sc, i) => {
+        const w = {};
+        objectives.forEach((o) => { w[o] = 0; });
+        DEMO.objectiveOrder.forEach((o, k) => { w[o] = sc.w[k]; });
+        return { id: "demo-scenario-" + i, name: sc.name, weights: w, color: SCENARIO_COLORS[i % SCENARIO_COLORS.length] };
+      }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objKey, rows]);
+
+  // Given a set of weights, set one objective to a new value and share the rest among the unlocked others
+  function redistribute(prev, col, newVal) {
+    {
+      const lockedOthersSum = objectives
+        .filter((o) => o !== col && locked[o])
+        .reduce((s, o) => s + (prev[o] || 0), 0);
+      const maxAllowed = 100 - lockedOthersSum;
+      const clamped = Math.min(newVal, maxAllowed);
+      const others = objectives.filter((o) => o !== col && !locked[o]);
+      const remaining = maxAllowed - clamped;
+      const othersSum = others.reduce((s, o) => s + (prev[o] || 0), 0);
+      const next = { ...prev, [col]: clamped };
+      if (others.length > 0) {
+        if (othersSum <= 0) {
+          const share = remaining / others.length;
+          others.forEach((o) => { next[o] = share; });
+        } else {
+          others.forEach((o) => {
+            next[o] = ((prev[o] || 0) / othersSum) * remaining;
+          });
+        }
+      }
+      return next;
+    }
+  }
+
+  // The sliders always update right away. The rankings/charts use the applied weights,
+  // which follow the sliders automatically only when "Live updates" is on.
+  function commitWeight(col, rawVal) {
+    const newVal = Math.max(0, Math.min(100, rawVal));
+    if (liveUpdates) {
+      // Update the applied weights AND the sliders, so the sliders always show the corrected values
+      setWeights((prev) => {
+        const next = redistribute(prev, col, newVal);
+        setDraftWeights(next);
+        return next;
+      });
+    } else {
+      setDraftWeights((prev) => redistribute({ ...weights, ...prev }, col, newVal));
+    }
+  }
+
+  function sliderWeights() {
+    const w = {};
+    objectives.forEach((o) => { w[o] = draftWeights[o] ?? weights[o] ?? 0; });
+    return w;
+  }
+
+  function applyWeights() {
+    setWeights(sliderWeights());
+  }
+
+  function setLiveMode(on) {
+    setLiveUpdates(on);
+    setAutoLiveOff(false);
+    if (on) applyWeights();
+  }
+
+  // Fast path for slider dragging: update the on-screen number instantly,
+  // but wait briefly before running the real recalculation across all objectives.
+  function draftWeightChange(col, val) {
+    // Don't let a slider go past what the locked weights leave free (e.g. max 60% if another is locked at 40%)
+    setDraftWeights((prev) => {
+      const base = { ...weights, ...prev };
+      const lockedOthersSum = objectives
+        .filter((o) => o !== col && locked[o])
+        .reduce((sum, o) => sum + (base[o] || 0), 0);
+      return { ...prev, [col]: Math.min(val, 100 - lockedOthersSum) };
+    });
+    clearTimeout(weightDebounceRef.current);
+    weightDebounceRef.current = setTimeout(() => commitWeight(col, val), 60);
+  }
+
+  function toggleLock(col) {
+    setLocked((prev) => {
+      const willLock = !prev[col];
+      if (willLock) {
+        const unlockedCount = objectives.filter((o) => o !== col && !prev[o]).length;
+        if (unlockedCount === 0) return prev; // never allow locking the last unlocked objective
+      }
+      return { ...prev, [col]: willLock };
+    });
+  }
+
+  useEffect(() => {
+    // Before a file is loaded there is nothing to switch between, so keep the default (2D scatter) tab
+    if (objectives.length === 0 && variables.length === 0) return;
+    if (chartView === "varparallel") {
+      setChartView("parallel");
+    } else if (chartView === "scatter" && objectives.length < 2) {
+      setChartView(objectives.length + variables.length >= 2 ? "parallel" : "scenarios");
+    } else if (chartView === "parallel" && objectives.length + variables.length < 2) {
+      setChartView("scenarios");
+    } else if (chartView === "histograms" && variables.length === 0) {
+      setChartView(objectives.length >= 2 ? "scatter" : "scenarios");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objectives.length, variables.length]);
+
+  useEffect(() => {
+    setDraftWeights(weights);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(weights)]);
+
+  useEffect(() => {
+    setTopNDraft(String(topN));
+  }, [topN]);
+
+  function saveScenario(rawName) {
+    const name = (rawName !== undefined ? rawName : newScenarioName).trim();
+    if (!name || scenarios.length >= 8) return;
+    const color = SCENARIO_COLORS[scenarios.length % SCENARIO_COLORS.length];
+    const w = sliderWeights();
+    if (!liveUpdates) setWeights(w);
+    setScenarios((prev) => [...prev, { id: Date.now() + "-" + Math.random(), name, weights: w, color }]);
+    setNewScenarioName("");
+    setShowSaveScenario(false);
+    setTabScenarioName("");
+    setShowTabSave(false);
+  }
+
+  function commitTopN(val) {
+    const n = Math.max(1, Number(val) || 1);
+    setTopN(n);
+    setTopNDraft(String(n));
+  }
+
+  function setRole(col, role) {
+    setRoles((prev) => ({ ...prev, [col]: role }));
+  }
+
+  function computeResultsForWeights(weightsObj) {
+    if (!rows || objectives.length < 1) return null;
+    const X = rows.map((r) => objectives.map((o) => Number(r[o])));
+    const denom = objectives.map((_, j) => {
+      const s = Math.sqrt(X.reduce((acc, row) => acc + row[j] * row[j], 0));
+      return s || 1;
+    });
+    const R = X.map((row) => row.map((v, j) => v / denom[j]));
+    const wsum = objectives.reduce((s, o) => s + (weightsObj[o] || 0), 0) || 1;
+    const W = objectives.map((o) => (weightsObj[o] || 0) / wsum);
+    const V = R.map((row) => row.map((v, j) => v * W[j]));
+    const best = objectives.map((o, j) => {
+      const col = V.map((row) => row[j]);
+      return roles[o] === "max" ? Math.max(...col) : Math.min(...col);
+    });
+    const worst = objectives.map((o, j) => {
+      const col = V.map((row) => row[j]);
+      return roles[o] === "max" ? Math.min(...col) : Math.max(...col);
+    });
+    const scored = rows.map((r, i) => {
+      const row = V[i];
+      const dPlus = Math.sqrt(row.reduce((s, v, j) => s + (v - best[j]) ** 2, 0));
+      const dMinus = Math.sqrt(row.reduce((s, v, j) => s + (v - worst[j]) ** 2, 0));
+      const c = dPlus + dMinus === 0 ? 0 : dMinus / (dPlus + dMinus);
+      return { row: r, score: c, rowNum: i + 1 };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map((item, idx) => ({ ...item, rank: idx + 1 }));
+  }
+
+  const results = useMemo(() => {
+    return computeResultsForWeights(weights);
+  }, [rows, objKey, JSON.stringify(weights), JSON.stringify(roles)]);
+
+  const chartData = useMemo(() => {
+    if (!results || !xCol || !yCol) return null;
+    const xs = results.map((r) => Number(r.row[xCol]));
+    const ys = results.map((r) => Number(r.row[yCol]));
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    return { xs, ys, xMin, xMax, yMin, yMax };
+  }, [results, xCol, yCol]);
+
+  // Scatter chart size: height is directly controlled by our own drag handle (reliable),
+  // width is measured passively since it only changes with window/layout resizes, not dragging.
+  const scatterContainerRef = useRef(null);
+  const [scatterHeight, setScatterHeight] = useState(380);
+  const [scatterWidth, setScatterWidth] = useState(600);
+  useEffect(() => {
+    if (chartView !== "scatter") return;
+    function measure() {
+      const el = scatterContainerRef.current;
+      // Prefer a direct measurement of the container when available and non-zero...
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        // getBoundingClientRect includes the container's own padding, but the SVG only
+        // has the CONTENT area to draw in (padding: 14px right, 74px left = 88px total) — subtract it.
+        const contentWidth = rect.width - 76;
+        if (contentWidth > 0) {
+          setScatterWidth(contentWidth);
+          return;
+        }
+      }
+      // ...otherwise fall back to computing it from the window's own width directly,
+      // which reliably updates on every resize regardless of nested-layout quirks.
+      const sidebarWidth = 284, mainPadding = 48, chartPadding = 76, borders = 2;
+      const fallback = Math.max(200, window.innerWidth - sidebarWidth - mainPadding - chartPadding - borders);
+      setScatterWidth(fallback);
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400); // safety net in case resize events are swallowed in this environment
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+
+  function startScatterResize(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = scatterHeight;
+    function onMove(ev) {
+      setScatterHeight(Math.max(300, startHeight + (ev.clientY - startY)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function startParallelResize(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = parallelHeight;
+    function onMove(ev) {
+      setParallelHeight(Math.max(300, startHeight + (ev.clientY - startY)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  const [scenXCol, setScenXCol] = useState(null);
+  const [scenYCol, setScenYCol] = useState(null);
+  const scenScatterContainerRef = useRef(null);
+  const [scenScatterWidth, setScenScatterWidth] = useState(600);
+  const [scenScatterHeight, setScenScatterHeight] = useState(380);
+  useEffect(() => {
+    if (chartView !== "scenarios") return;
+    function measure() {
+      const el = scenScatterContainerRef.current;
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        const contentWidth = rect.width - 76;
+        if (contentWidth > 0) { setScenScatterWidth(contentWidth); return; }
+      }
+      const sidebarWidth = 284, mainPadding = 48, chartPadding = 76, borders = 2;
+      const fallback = Math.max(200, window.innerWidth - sidebarWidth - mainPadding - chartPadding - borders);
+      setScenScatterWidth(fallback);
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400);
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+  function startScenScatterResize(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = scenScatterHeight;
+    function onMove(ev) {
+      setScenScatterHeight(Math.max(300, startHeight + (ev.clientY - startY)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  // Parallel coordinates: normalize each objective so "better" always sits near the top of its axis
+  const pcRanges = useMemo(() => {
+    if (!results || objectives.length < 2) return null;
+    return objectives.map((o) => {
+      const vals = results.map((r) => Number(r.row[o]));
+      return { min: Math.min(...vals), max: Math.max(...vals) };
+    });
+  }, [results, objKey]);
+
+  function getVariableHistogram(colName) {
+    const vals = results.map((r) => Number(r.row[colName]));
+    const unique = Array.from(new Set(vals)).sort((a, b) => a - b);
+    let bins;
+    if (unique.length <= 12) {
+      bins = unique.map((u) => ({ label: fmtShort(u), full: fmtNum(u), test: (v) => v === u }));
+    } else {
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const nBins = 8;
+      const width = (max - min) / nBins || 1;
+      bins = Array.from({ length: nBins }, (_, i) => {
+        const lo = min + i * width;
+        const hi = i === nBins - 1 ? max : min + (i + 1) * width;
+        return {
+          label: `${fmtShort(lo)}–${fmtShort(hi)}`,
+          full: `${fmtNum(lo)}–${fmtNum(hi)}`,
+          test: (v) => (i === nBins - 1 ? v >= lo && v <= hi : v >= lo && v < hi),
+        };
+      });
+    }
+    const counts = bins.map((b) => results.filter((r) => b.test(Number(r.row[colName]))).length);
+    const maxCount = Math.max(...counts, 1);
+    const topMarkers = bins.map(() => []);
+    results.filter((r) => r.rank <= topN).forEach((r) => {
+      const v = Number(r.row[colName]);
+      const idx = bins.findIndex((b) => b.test(v));
+      if (idx >= 0) topMarkers[idx].push(r.rank);
+    });
+    return { bins, counts, maxCount, topMarkers };
+  }
+
+  const parallelContainerRef = useRef(null);
+  const [parallelWidth, setParallelWidth] = useState(600);
+  const [parallelHeight, setParallelHeight] = useState(420);
+  useEffect(() => {
+    if (chartView !== "parallel") return;
+    function measure() {
+      const el = parallelContainerRef.current;
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0) {
+          setParallelWidth(rect.width);
+          return;
+        }
+      }
+      const sidebarWidth = 284, mainPadding = 48, borders = 2;
+      const fallback = Math.max(200, window.innerWidth - sidebarWidth - mainPadding - borders);
+      setParallelWidth(fallback);
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400);
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+
+  const scenPcContainerRef = useRef(null);
+  const [scenPcWidth, setScenPcWidth] = useState(600);
+  useEffect(() => {
+    if (chartView !== "scenarios") return;
+    function measure() {
+      const el = scenPcContainerRef.current;
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0) { setScenPcWidth(rect.width - 2); return; }
+      }
+      const sidebarWidth = 284, mainPadding = 48, borders = 2;
+      setScenPcWidth(Math.max(200, window.innerWidth - sidebarWidth - mainPadding - borders));
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400);
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+
+  function pcGoodness(value, idx) {
+    const { min, max } = pcRanges[idx];
+    if (max === min) return 0.5;
+    const norm = (value - min) / (max - min);
+    return roles[objectives[idx]] === "max" ? norm : 1 - norm;
+  }
+
+  // If a column stops being a variable (relabeled in step 2), remove it from every group
+  const varKey = variables.join("|");
+  useEffect(() => {
+    setVarGroups((prev) => prev.map((g) => ({ ...g, vars: g.vars.filter((v) => variables.includes(v)) })));
+    setGroupEditor((prev) => (prev ? { ...prev, vars: prev.vars.filter((v) => variables.includes(v)) } : prev));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [varKey]);
+
+  const varPcContainerRef = useRef(null);
+  const [varPcWidth, setVarPcWidth] = useState(600);
+  useEffect(() => {
+    if (chartView !== "varparallel") return;
+    function measure() {
+      const el = varPcContainerRef.current;
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0) { setVarPcWidth(rect.width - 2); return; }
+      }
+      const sidebarWidth = 284, mainPadding = 48, borders = 2;
+      setVarPcWidth(Math.max(200, window.innerWidth - sidebarWidth - mainPadding - borders));
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400);
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+
+  function saveGroupEditor() {
+    if (!groupEditor) return;
+    const name = groupEditor.name.trim();
+    if (!name || groupEditor.vars.length === 0) return;
+    if (groupEditor.id) {
+      setVarGroups((prev) => prev.map((g) => (g.id === groupEditor.id ? { ...g, name, vars: [...groupEditor.vars] } : g)));
+    } else {
+      setVarGroups((prev) => [...prev, { id: Date.now() + "-" + Math.random(), name, vars: [...groupEditor.vars] }]);
+    }
+    setGroupEditor(null);
+  }
+
+  function toggleEditorVar(v) {
+    setGroupEditor((prev) => {
+      if (!prev) return prev;
+      const has = prev.vars.includes(v);
+      return { ...prev, vars: has ? prev.vars.filter((x) => x !== v) : [...prev.vars, v] };
+    });
+  }
+
+  // Each scenario's winning design plus designs tied with it; scenarios that picked the same design share one line
+  function getScenarioLines() {
+    const perScen = scenarios.map((sc) => {
+      const res = computeResultsForWeights(sc.weights) || [];
+      const winner = res[0];
+      const ties = winner ? res.filter((r) => r.rowNum !== winner.rowNum && Math.abs(r.score - winner.score) < 1e-9) : [];
+      return { sc, winner, ties };
+    });
+    const winnerLines = [];
+    perScen.forEach((p) => {
+      if (!p.winner) return;
+      const existing = winnerLines.find((l) => l.result.rowNum === p.winner.rowNum);
+      if (existing) existing.scens.push(p.sc);
+      else winnerLines.push({ result: p.winner, scens: [p.sc] });
+    });
+    return { perScen, winnerLines };
+  }
+
+  // ---------- Parallel coordinates: variables (left) then objectives (right) ----------
+  const PC_MONO = "9px 'Cascadia Code', ui-monospace, monospace";
+  function pcShownColumns() {
+    return [
+      ...variables.filter((v) => !pcHidden.includes(v)).map((c) => ({ col: c, kind: "var" })),
+      ...objectives.filter((o) => !pcHidden.includes(o)).map((c) => ({ col: c, kind: "obj" })),
+    ];
+  }
+  function pcChartW() {
+    const inches = pcSizeMode === "custom" ? Math.min(40, Math.max(3, Number(pcCustomIn) || 6.5)) : Number(pcSizeMode);
+    return Math.round(inches * 96) - EXPORT_PAD * 2;
+  }
+  function pcExportMeta(filename, extra) {
+    const base = { filename, ...(extra || {}) };
+    if (pcSizeMode === "custom") {
+      const w = Math.min(40, Math.max(3, Number(pcCustomIn) || 6.5));
+      const h = Math.min(30, Math.max(2, Number(pcCustomH) || 5));
+      return exportSize(base, w, h);
+    }
+    return { ...base, chartW: pcChartW() };
+  }
+  function pcHeightFor(key, screenH) {
+    const m = exportTarget === key && exportJobRef.current && exportJobRef.current.meta;
+    return m && m.chartH ? m.chartH : screenH;
+  }
+  // Same idea for the 2D scatter plots
+  function scatExportMeta(meta) {
+    if (scatSizeMode !== "custom") return meta;
+    const w = Math.min(40, Math.max(3, Number(scatCustomW) || 6.5));
+    const h = Math.min(30, Math.max(2, Number(scatCustomH) || 4));
+    return exportSize(meta, w, h);
+  }
+  function scatDims(key, screenW, screenH) {
+    const m = exportTarget === key && exportJobRef.current && exportJobRef.current.meta;
+    if (!m) return { W: screenW, H: screenH };
+    return { W: m.chartW || EXPORT_W, H: m.chartH || screenH };
+  }
+  function pcWidthFor(key, screenW) {
+    if (exportTarget === key) return (exportJobRef.current && exportJobRef.current.meta && exportJobRef.current.meta.chartW) || EXPORT_W;
+    return screenW;
+  }
+
+  // Checkbox list (open by default) to choose which axes appear
+  function pcChecklist() {
+    const toggle = (c) => setPcHidden((prev) => (prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]));
+    const small = { fontSize: 11, fontWeight: 600, color: TEXT, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 8px", cursor: "pointer" };
+    const shownCount = pcShownColumns().length;
+    const total = objectives.length + variables.length;
+    const section = (title, cols, color) => cols.length > 0 && (
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color, letterSpacing: "0.03em", textTransform: "uppercase", marginBottom: 4 }}>{title}</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "3px 14px" }}>
+          {cols.map((c) => (
+            <label key={c} style={{ display: "flex", alignItems: "flex-start", gap: 6, fontSize: 12.5, cursor: "pointer", minWidth: 0 }}>
+              <input type="checkbox" checked={!pcHidden.includes(c)} onChange={() => toggle(c)} style={{ marginTop: 2 }} />
+              <span style={{ wordBreak: "break-word" }}>{labelFor(c)}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+    );
+    return (
+      <div style={{ border: `1px solid ${BORDER}`, borderRadius: 8, marginBottom: 14, background: "#fff" }}>
+        <button
+          onClick={() => setPcPanelOpen((v) => !v)}
+          style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", background: "none", border: "none", padding: "10px 14px", cursor: "pointer", fontSize: 13, fontWeight: 700, color: TEXT }}
+        >
+          <span>Axes shown <span style={{ fontWeight: 400, color: MUTED, fontSize: 12 }}>({shownCount} of {total}). Untick any objective or design parameter to hide it.</span></span>
+          <span style={{ color: MUTED, fontSize: 12 }}>{pcPanelOpen ? "Hide ▴" : "Show ▾"}</span>
+        </button>
+        {pcPanelOpen && (
+          <div style={{ padding: "0 14px 12px", borderTop: `1px solid ${BORDER}` }}>
+            <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+              <button style={small} onClick={() => setPcHidden([])}>Tick all</button>
+              <button style={small} onClick={() => setPcHidden([...variables, ...objectives])}>Untick all</button>
+              {variables.length > 0 && <button style={small} onClick={() => setPcHidden((prev) => Array.from(new Set([...prev, ...variables])))}>Hide all design parameters</button>}
+            </div>
+            {section("Design parameters", variables, TEXT)}
+            {section("Objectives", objectives, EMERALD)}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Download width choice for the parallel coordinates plots
+  function pcSizeControl() {
+    const sel = { fontSize: 10.5, color: MUTED, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 4px", background: "#fff" };
+    return (
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10.5, color: MUTED }}>
+        Width:
+        <select value={pcSizeMode} onChange={(e) => setPcSizeMode(e.target.value)} style={sel} title="Size of the downloaded image">
+          <option value="6.5">6.5 in (portrait page)</option>
+          <option value="9">9 in (landscape page)</option>
+          <option value="custom">Custom (width × height)</option>
+        </select>
+        {pcSizeMode === "custom" && (
+          <>
+            <input
+              type="text" inputMode="decimal" value={pcCustomIn}
+              onChange={(e) => { if (/^\d{0,2}(\.\d?)?$/.test(e.target.value)) setPcCustomIn(e.target.value); }}
+              style={{ ...sel, width: 38, textAlign: "right" }} title="Width in inches (3 to 40)"
+            />
+            in ×
+            <input
+              type="text" inputMode="decimal" value={pcCustomH}
+              onChange={(e) => { if (/^\d{0,2}(\.\d?)?$/.test(e.target.value)) setPcCustomH(e.target.value); }}
+              style={{ ...sel, width: 38, textAlign: "right" }} title="Height in inches (2 to 30)"
+            />
+            in
+          </>
+        )}
+      </span>
+    );
+  }
+
+  // Axis title size for the scatter plots: 14 px normally, smaller (down to 9 px) when the title is longer than the space for it
+  function axisTitleSize(text, room) {
+    const w = textWidth(text, "600 14px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif");
+    return w <= room ? 14 : Math.max(9, Math.floor((14 * room) / w * 10) / 10);
+  }
+
+  // Download size choice for the 2D scatter plots
+  function scatSizeControl() {
+    const sel = { fontSize: 10.5, color: MUTED, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 4px", background: "#fff" };
+    const box = (val, set, title) => (
+      <input
+        type="text" inputMode="decimal" value={val}
+        onChange={(e) => { if (/^\d{0,2}(\.\d?)?$/.test(e.target.value)) set(e.target.value); }}
+        style={{ ...sel, width: 38, textAlign: "right" }} title={title}
+      />
+    );
+    return (
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 10.5, color: MUTED }}>
+        Size:
+        <select value={scatSizeMode} onChange={(e) => setScatSizeMode(e.target.value)} style={sel} title="Size of the downloaded image">
+          <option value="standard">Standard (6.5 in wide)</option>
+          <option value="custom">Custom (width × height)</option>
+        </select>
+        {scatSizeMode === "custom" && (
+          <>
+            {box(scatCustomW, setScatCustomW, "Width in inches (3 to 40)")}
+            in ×
+            {box(scatCustomH, setScatCustomH, "Height in inches (2 to 30)")}
+            in
+          </>
+        )}
+      </span>
+    );
+  }
+
+  // Splits an axis title into up to maxLines lines of at most maxChars characters, breaking between words where possible
+  function wrapWords(text, maxChars, maxLines) {
+    const words = String(text).split(/\s+/).filter(Boolean);
+    const lines = [];
+    let cur = "";
+    words.forEach((w) => {
+      while (w.length > maxChars + 2) { // a single word much longer than the line: split it (up to 2 extra characters may stick out)
+        if (cur) { lines.push(cur); cur = ""; }
+        lines.push(w.slice(0, maxChars)); w = w.slice(maxChars);
+      }
+      if (!cur) cur = w;
+      else if ((cur + " " + w).length <= maxChars) cur += " " + w;
+      else { lines.push(cur); cur = w; }
+    });
+    if (cur) lines.push(cur);
+    if (lines.length > maxLines) {
+      const kept = lines.slice(0, maxLines);
+      kept[maxLines - 1] = kept[maxLines - 1].slice(0, Math.max(1, maxChars - 1)) + "…";
+      return kept;
+    }
+    return lines;
+  }
+
+  // Draws the parallel coordinates plot. mode "main": top designs in color, others grey. mode "scen": scenario winners (+ faded ties).
+  function renderPcSvg(exportKey, W, H, mode, lines) {
+    const cols = pcShownColumns();
+    const n = cols.length;
+    const hasObj = cols.some((c) => c.kind === "obj");
+    const info = cols.map((c) => {
+      const vals = results.map((r) => Number(r.row[c.col])).filter((x) => Number.isFinite(x));
+      const min = vals.length ? Math.min(...vals) : 0;
+      const max = vals.length ? Math.max(...vals) : 0;
+      const counts = new Map();
+      vals.forEach((x) => counts.set(x, (counts.get(x) || 0) + 1));
+      const unique = Array.from(counts.keys()).sort((a, b) => a - b);
+      return { ...c, min, max, constant: min === max, counts, unique, discrete: unique.length <= 12, isMax: roles[c.col] === "max" };
+    });
+    // Side margins leave room for the end labels of objective axes and the titles of the outer axes
+    const endHalf = Math.max(0, ...info.filter((a, i) => a.kind === "obj" && (i === 0 || i === n - 1)).map((a) => Math.max(textWidth(fmtShort(a.min), PC_MONO), textWidth(fmtShort(a.max), PC_MONO)) / 2));
+    const marginSide = Math.max(56, Math.ceil(endHalf + 8));
+    // Space between neighbouring axes decides how long title lines can be (about 6.3 px per character at size 10.5)
+    const spacing = n === 1 ? W - marginSide * 2 : (W - marginSide * 2) / (n - 1);
+    const maxChars = Math.max(5, Math.floor((spacing - 6) / 6.3));
+    const nameUnit = info.map((a) => splitUnit(labelFor(a.col)));
+    const titles = nameUnit.map((nu) => wrapWords(nu.name, maxChars, 3));
+    const units = nameUnit.map((nu) => (nu.unit ? wrapWords("(" + nu.unit + ")", maxChars, 1)[0] : ""));
+    const hasUnits = units.some((u) => u);
+    const titleLinesMax = Math.max(1, ...titles.map((t) => t.length)) + (hasUnits ? 1 : 0);
+    // "lower = better" goes on two lines when the axes are close together
+    const betterTwoLines = spacing < 95;
+    const marginTop = 30 + titleLinesMax * 13, marginBottom = hasObj ? (betterTwoLines ? 56 : 46) : 30;
+    const plotTop = marginTop, plotBottom = H - marginBottom, plotH = plotBottom - plotTop;
+    const axisX = (i) => (n === 1 ? W / 2 : marginSide + i * ((W - marginSide * 2) / (n - 1)));
+    const yFor = (value, a) => {
+      if (a.constant) return plotTop + plotH / 2;
+      const t = (value - a.min) / (a.max - a.min);
+      const good = a.kind === "obj" ? (a.isMax ? t : 1 - t) : t; // objectives: "better" at the top; variables: highest at the top
+      return plotBottom - good * plotH;
+    };
+    const pointsFor = (r) => {
+      const pts = [];
+      info.forEach((a, i) => { const v = Number(r.row[a.col]); if (Number.isFinite(v)) pts.push(`${axisX(i)},${yFor(v, a)}`); });
+      return pts.join(" ");
+    };
+    return (
+      <svg data-export={exportKey} width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+        {info.map((a, i) => {
+          const x = axisX(i);
+          const isFirst = i === 0, isLast = i === n - 1 && n > 1;
+          const titleLines = titles[i];
+          // Titles are centred on their axis; the outer ones are nudged inward only if they would run off the edge
+          const halfTitle = (Math.max(...titleLines.map((l) => l.length), units[i].length) * 6.3) / 2;
+          const anchor = "middle";
+          const titleX = Math.min(Math.max(x, halfTitle + 2), W - halfTitle - 2);
+          const titleColor = a.kind === "obj" ? EMERALD : TEXT;
+          const tickAnchor = isLast ? "end" : "start";
+          const tickX = isLast ? x - 6 : x + 6;
+          const roomy = a.discrete && a.unique.length > 0 && plotH / Math.max(1, a.unique.length - 1) >= 13;
+          const ticks = a.constant ? [a.min] : roomy ? a.unique : [a.min, a.max];
+          return (
+            <g key={a.col}>
+              <line x1={x} x2={x} y1={plotTop} y2={plotBottom} stroke={a.kind === "obj" ? "#9FC7B6" : "#C9C9C5"} strokeWidth={a.kind === "obj" ? 1.5 : 1} />
+              {titleLines.map((line, li) => (
+                <text key={li} x={titleX} y={15 + li * 13} textAnchor={anchor} fontSize="10.5" fontWeight="600" fill={titleColor} className="mono">{line}</text>
+              ))}
+              {units[i] && (
+                <text x={titleX} y={15 + titleLines.length * 13} textAnchor={anchor} fontSize="9.5" fill={a.kind === "obj" ? EMERALD : MUTED} className="mono">{units[i]}</text>
+              )}
+              {a.kind === "var" ? (
+                ticks.map((t) => (
+                  <g key={t}>
+                    <line x1={x - 3} x2={x + 3} y1={yFor(t, a)} y2={yFor(t, a)} stroke="#9A9A96" strokeWidth="1" />
+                    <text x={tickX} y={yFor(t, a) + 3} textAnchor={tickAnchor} fontSize="9" fill={MUTED} className="mono">
+                      {fmtShort(t)}{mode === "main" && (roomy || a.constant) ? ` (${a.counts.get(t) || 0})` : ""}
+                    </text>
+                  </g>
+                ))
+              ) : (
+                <>
+                  <text x={x} y={plotTop - 6} textAnchor="middle" fontSize="9.5" fill={EMERALD} className="mono">{fmtShort(a.isMax ? a.max : a.min)}</text>
+                  <text x={x} y={plotBottom + 15} textAnchor="middle" fontSize="9.5" fill={MUTED} className="mono">{fmtShort(a.isMax ? a.min : a.max)}</text>
+                  {betterTwoLines ? (
+                    <>
+                      <text x={x} y={H - 22} textAnchor="middle" fontSize="10" fill={EMERALD}>{a.isMax ? "higher" : "lower"}</text>
+                      <text x={x} y={H - 10} textAnchor="middle" fontSize="10" fill={EMERALD}>= better</text>
+                    </>
+                  ) : (
+                    <text x={x} y={H - 10} textAnchor="middle" fontSize="10" fill={EMERALD}>{a.isMax ? "higher = better" : "lower = better"}</text>
+                  )}
+                </>
+              )}
+              {a.kind === "var" && a.constant && <text x={x} y={plotBottom + 18} textAnchor="middle" fontSize="9.5" fill={MUTED}>same in all solutions</text>}
+            </g>
+          );
+        })}
+
+        {mode === "main" && [...results]
+          .sort((a, b) => (a.rank <= topN) - (b.rank <= topN) || b.rank - a.rank)
+          .map((r) => {
+            const isTop = r.rank <= topN;
+            const isHover = hoverLine && hoverLine.rank === r.rank;
+            return (
+              <polyline
+                key={r.rank} points={pointsFor(r)} fill="none" stroke={rankColor(r.rank)}
+                strokeWidth={isHover ? 4 : isTop ? 2.5 : 1} opacity={isTop || isHover ? 1 : 0.4}
+                onMouseEnter={() => setHoverLine(r)} onMouseLeave={() => setHoverLine(null)} style={{ cursor: "pointer" }}
+              />
+            );
+          })}
+
+        {mode === "scen" && lines && lines.perScen.map((p) => p.ties.map((r) => {
+          const isHover = hoverScenLine && hoverScenLine.kind === "tie" && hoverScenLine.scen.id === p.sc.id && hoverScenLine.result.rowNum === r.rowNum;
+          return (
+            <polyline
+              key={p.sc.id + "-" + r.rowNum} points={pointsFor(r)} fill="none"
+              stroke={lerpColor(p.sc.color, "#FFFFFF", 0.45)} strokeWidth={isHover ? 3 : 1.4}
+              onMouseEnter={() => setHoverScenLine({ kind: "tie", scen: p.sc, result: r, identical: objectives.every((o) => Number(r.row[o]) === Number(p.winner.row[o])), winnerRow: p.winner.rowNum })}
+              onMouseLeave={() => setHoverScenLine(null)} style={{ cursor: "pointer" }}
+            />
+          );
+        }))}
+        {mode === "scen" && lines && lines.winnerLines.map((l) => {
+          const k = l.scens.length;
+          const isHover = hoverScenLine && hoverScenLine.kind === "winner" && hoverScenLine.result.rowNum === l.result.rowNum;
+          return (
+            <g key={l.result.rowNum} onMouseEnter={() => setHoverScenLine({ kind: "winner", scens: l.scens, result: l.result })} onMouseLeave={() => setHoverScenLine(null)} style={{ cursor: "pointer" }}>
+              {l.scens.map((sc, i) => (
+                <polyline
+                  key={sc.id} points={pointsFor(l.result)} fill="none" stroke={sc.color} strokeWidth={isHover ? 4.5 : 3}
+                  strokeDasharray={k > 1 ? `8 ${8 * (k - 1)}` : undefined} strokeDashoffset={k > 1 ? -8 * i : undefined}
+                />
+              ))}
+            </g>
+          );
+        })}
+      </svg>
+    );
+  }
+
+  // Hover box listing a design's values for the axes currently shown
+  function pcHoverValues(row) {
+    return pcShownColumns().map((c) => (
+      <div key={c.col} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: c.kind === "obj" ? EMERALD_DARK : TEXT }}>{labelFor(c.col)}: {fmtNum(Number(row[c.col]))}</div>
+    ));
+  }
+
+  function startExport(key, format, meta) {
+    if (exportTarget) return;
+    setExportError("");
+    setHoverLine(null); setHoverVarLine(null); setHoverScenLine(null); setHoverScenVarLine(null); setHoverScenPoint(null); setHoverPoint(null);
+    exportJobRef.current = { key, format, meta };
+    setExportTarget(key);
+  }
+
+  useEffect(() => {
+    if (!exportTarget || !exportJobRef.current) return;
+    const job = exportJobRef.current;
+    // Wait two frames so the chart has been redrawn at export size before capturing it
+    requestAnimationFrame(() => requestAnimationFrame(async () => {
+      const el = document.querySelector(`[data-export="${CSS.escape(job.key)}"]`);
+      try {
+        if (!el) throw new Error("chart not found");
+        const clone = el.cloneNode(true);
+        // Measure on the live element, then let the screen go back to normal right away
+        const holder = document.createElement("div");
+        holder.style.cssText = "position:absolute;left:-10000px;top:0;visibility:hidden;";
+        holder.appendChild(clone);
+        el.ownerDocument.body.appendChild(holder);
+        // Copy computed fonts from the live chart before it changes back
+        const liveTexts = el.querySelectorAll("text");
+        clone.querySelectorAll("text").forEach((t, i) => { t.style.fontFamily = window.getComputedStyle(liveTexts[i]).fontFamily; });
+        setExportTarget(null);
+        exportJobRef.current = null;
+        await exportSvgElement(clone, job.meta, job.format);
+        holder.remove();
+      } catch (e) {
+        setExportTarget(null);
+        exportJobRef.current = null;
+        setExportError("Sorry, that chart couldn't be downloaded. Please try again, or try the other format.");
+      }
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportTarget]);
+
+  // Small PNG / SVG buttons shown next to each chart
+  function dlButtons(key, meta) {
+    const btn = { fontSize: 10, fontWeight: 600, color: MUTED, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 6px", cursor: exportTarget ? "wait" : "pointer", lineHeight: 1.5 };
+    return (
+      <span style={{ display: "inline-flex", gap: 4, flexShrink: 0, alignItems: "center" }}>
+        <button style={btn} disabled={!!exportTarget} title="Download as a PNG image" onClick={() => startExport(key, "png", meta)}>↓ PNG</button>
+        <button style={btn} disabled={!!exportTarget} title="Download as an SVG (sharp at any size, editable)" onClick={() => startExport(key, "svg", meta)}>↓ SVG</button>
+      </span>
+    );
+  }
+
+  // Histogram drawn as SVG so it can be downloaded. markerBins[i] = markers above bar i: { color, shape: "dot" | "square", title }
+  function renderHistSvg(exportKey, v, markerBins, availW) {
+    const { bins, counts, maxCount } = getVariableHistogram(v);
+    const isExp = exportTarget === exportKey;
+    const W = isExp ? EXPORT_W : Math.max(220, availW || 300);
+    const H = isExp ? 280 : 228;
+    // Count scale: round, whole-number steps (1, 2, 5, 10, 20, 50 ...) giving about 4 grid lines
+    const rough = Math.max(1, maxCount / 4);
+    const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    const step = [1, 2, 5, 10].map((m) => m * mag).find((c) => c >= rough && Number.isInteger(c)) || Math.max(1, Math.ceil(rough));
+    const yMax = Math.max(step, Math.ceil(maxCount / step) * step);
+    const ticks = [];
+    for (let t = 0; t <= yMax + 1e-9; t += step) ticks.push(t);
+    const tickFont = (isExp ? 10 : 9) + "px 'Cascadia Code', ui-monospace, monospace";
+    const tickW = Math.max(...ticks.map((t) => textWidth(fmtNum(t), tickFont)));
+    const titleSize = isExp ? 10.5 : 9.5;
+    const plotLeft = titleSize + 8 + tickW + 6; // room for the "Number of solutions" title and the count numbers
+    const plotW = W - plotLeft;
+    const nb = bins.length;
+    const gap = Math.max(3, Math.min(8, plotW / nb * 0.08));
+    // Bars are at most about a quarter of the chart wide, and the group of bars is centered,
+    // so variables with only one or two values don't fill the whole chart with one wide bar
+    const binW = Math.min((plotW - gap * (nb - 1)) / nb, plotW * 0.25);
+    const groupW = nb * binW + (nb - 1) * gap;
+    const startX = plotLeft + (plotW - groupW) / 2;
+    const mSize = isExp ? 9 : 8;
+    const perRow = Math.max(1, Math.floor((binW + 2) / (mSize + 2)));
+    const maxRows = Math.max(0, ...markerBins.map((m) => Math.ceil(m.length / perRow)));
+    const axisLabelH = isExp ? 18 : 16; // x-axis title (column name and unit) under the value labels
+    const labelH = (isExp ? 18 : 16) + axisLabelH;
+    const top = maxRows * (mSize + 2) + 8;
+    const barsBottom = H - labelH;
+    const barsH = barsBottom - top;
+    const yOf = (c) => barsBottom - (c / yMax) * barsH;
+    const labelSize = isExp ? 10 : 9;
+    const labelFont = labelSize + "px 'Cascadia Code', ui-monospace, monospace";
+    const fitLabel = (text) => {
+      if (textWidth(text, labelFont) <= binW) return text;
+      let cut = text.length;
+      while (cut > 1 && textWidth(text.slice(0, cut) + "…", labelFont) > binW) cut--;
+      return text.slice(0, cut) + "…";
+    };
+    return (
+      <svg data-export={exportKey} width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+        {/* Count scale and faint grid lines */}
+        {ticks.map((t) => (
+          <g key={"t" + t}>
+            <line x1={plotLeft} x2={W} y1={yOf(t)} y2={yOf(t)} stroke={t === 0 ? "#C9C9C5" : "#E4E4E2"} strokeWidth="1" />
+            <text x={plotLeft - 6} y={yOf(t) + 3} textAnchor="end" fontSize={isExp ? 10 : 9} fill={MUTED} className="mono">{fmtNum(t)}</text>
+          </g>
+        ))}
+        <text x={titleSize - 1} y={(top + barsBottom) / 2} textAnchor="middle" fontSize={titleSize} fill={MUTED} transform={`rotate(-90 ${titleSize - 1} ${(top + barsBottom) / 2})`}>Number of solutions</text>
+        {(() => {
+          const xTitle = labelFor(v);
+          const xFont = titleSize + "px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif";
+          let shown = xTitle;
+          if (textWidth(shown, xFont) > plotW) {
+            let cut = shown.length;
+            while (cut > 1 && textWidth(shown.slice(0, cut) + "…", xFont) > plotW) cut--;
+            shown = shown.slice(0, cut) + "…";
+          }
+          return <text x={plotLeft + plotW / 2} y={H - 3} textAnchor="middle" fontSize={titleSize} fill={MUTED}><title>{xTitle}</title>{shown}</text>;
+        })()}
+        {bins.map((b, i) => {
+          const x = startX + i * (binW + gap);
+          const h = counts[i] > 0 ? Math.max(2, (counts[i] / yMax) * barsH) : 0;
+          const barTop = barsBottom - h;
+          return (
+            <g key={i}>
+              <rect x={x} y={barTop} width={binW} height={h} fill="#C7C7C3" rx="2"><title>{`${b.full || b.label}: ${counts[i]} of ${results.length} solutions`}</title></rect>
+              {markerBins[i].map((m, k) => {
+                const row = Math.floor(k / perRow);
+                const inRow = Math.min(perRow, markerBins[i].length - row * perRow);
+                const col = k % perRow;
+                const rowW = inRow * mSize + (inRow - 1) * 2;
+                const mx = x + (binW - rowW) / 2 + col * (mSize + 2);
+                const my = barTop - 3 - (row + 1) * (mSize + 2) + 2;
+                return m.shape === "square"
+                  ? <rect key={k} x={mx} y={my} width={mSize} height={mSize} rx="2" fill={m.color}><title>{m.title}</title></rect>
+                  : <circle key={k} cx={mx + mSize / 2} cy={my + mSize / 2} r={mSize / 2 - 0.5} fill={m.color}><title>{m.title}</title></circle>;
+              })}
+              <text x={x + binW / 2} y={H - 3 - axisLabelH} textAnchor="middle" fontSize={labelSize} fill={MUTED} className="mono"><title>{b.full || b.label}</title>{fitLabel(b.label)}</text>
+            </g>
+          );
+        })}
+      </svg>
+    );
+  }
+
+  // ---------- Scenario comparison table downloads ----------
+  function scenarioTableRows() {
+    const info = scenarios.map((sc) => {
+      const res = computeResultsForWeights(sc.weights) || [];
+      const winner = res[0] || null;
+      const ties = winner ? res.filter((r) => Math.abs(r.score - winner.score) < 1e-9).length - 1 : 0;
+      return { sc, winner, ties };
+    });
+    return info.map((row, idx) => {
+      const earlier = row.winner ? info.slice(0, idx).find((o) => o.winner && o.winner.rowNum === row.winner.rowNum) : null;
+      return { ...row, sameAs: earlier ? earlier.sc.name : "" };
+    });
+  }
+
+  // Excel: always every column (weights, winner, notes, all variables), exact values
+  function exportScenarioExcel() {
+    try {
+      const rows = scenarioTableRows();
+      const nObj = objectives.length;
+      const header1 = ["Scenario", ...objectives.map((_, i) => (i === 0 ? "Weights (%)" : "")), "Winning solution", ...Array(nObj + 2 + variables.length).fill("")];
+      const header2 = ["", ...objectives.map(labelFor), "Solution #", ...objectives.map(labelFor), "Same as", "Tied with (other solutions)", ...variables.map(labelFor)];
+      const body = rows.map((r) => [
+        r.sc.name,
+        ...objectives.map((o) => Number(r.sc.weights[o] || 0)),
+        r.winner ? r.winner.rowNum : "",
+        ...objectives.map((o) => (r.winner ? Number(r.winner.row[o]) : "")),
+        r.sameAs,
+        r.winner ? r.ties : "",
+        ...variables.map((v) => {
+          if (!r.winner) return "";
+          const val = r.winner.row[v];
+          const num = Number(val);
+          return val !== null && val !== "" && Number.isFinite(num) ? num : (val ?? "");
+        }),
+      ]);
+      const ws = XLSX.utils.aoa_to_sheet([header1, header2, ...body]);
+      const winStart = 1 + nObj;
+      const winEnd = winStart + nObj + 2 + variables.length;
+      ws["!merges"] = [
+        { s: { r: 0, c: 0 }, e: { r: 1, c: 0 } },
+        ...(nObj > 1 ? [{ s: { r: 0, c: 1 }, e: { r: 0, c: nObj } }] : []),
+        { s: { r: 0, c: winStart }, e: { r: 0, c: winEnd } },
+      ];
+      // One decimal for weights
+      body.forEach((_, ri) => {
+        objectives.forEach((_, ci) => {
+          const ref = XLSX.utils.encode_cell({ r: ri + 2, c: 1 + ci });
+          if (ws[ref]) ws[ref].z = "0.0";
+        });
+      });
+      ws["!cols"] = header2.map((h, i) => ({ wch: Math.max(10, String(i === 0 ? "Scenario" : h).length + 2, ...(i === 0 ? rows.map((r) => r.sc.name.length + 2) : [])) }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Scenario comparison");
+      XLSX.writeFile(wb, "scenario_comparison.xlsx");
+    } catch (e) {
+      setExportError("Sorry, the Excel file couldn't be created. Please try again.");
+    }
+  }
+
+  // Ranked solutions: every design with its rank, score, objectives and all variables, plus a sheet with the weights used
+  function exportRankedExcel() {
+    try {
+      if (!results) return;
+      const header = ["Rank", "Score", "Solution #", ...objectives.map(labelFor), ...variables.map(labelFor)];
+      const body = results.map((r) => [
+        r.rank,
+        r.score,
+        r.rowNum,
+        ...objectives.map((o) => Number(r.row[o])),
+        ...variables.map((v) => {
+          const val = r.row[v];
+          const num = Number(val);
+          return val !== null && val !== "" && Number.isFinite(num) ? num : (val ?? "");
+        }),
+      ]);
+      const ws = XLSX.utils.aoa_to_sheet([header, ...body]);
+      body.forEach((_, ri) => {
+        const ref = XLSX.utils.encode_cell({ r: ri + 1, c: 1 });
+        if (ws[ref]) ws[ref].z = "0.000";
+      });
+      ws["!cols"] = header.map((h) => ({ wch: Math.max(9, String(h).length + 2) }));
+      // Second sheet: the weights and directions these rankings were calculated with
+      const wsum = objectives.reduce((sum, o) => sum + (weights[o] || 0), 0) || 1;
+      const ws2 = XLSX.utils.aoa_to_sheet([
+        ["Objective", "Direction", "Weight (%)"],
+        ...objectives.map((o) => [labelFor(o), roles[o] === "max" ? "Higher is better" : "Lower is better", ((weights[o] || 0) / wsum) * 100]),
+      ]);
+      objectives.forEach((_, i) => {
+        const ref = XLSX.utils.encode_cell({ r: i + 1, c: 2 });
+        if (ws2[ref]) ws2[ref].z = "0.0";
+      });
+      ws2["!cols"] = [{ wch: Math.max(12, ...objectives.map((o) => labelFor(o).length + 2)) }, { wch: 18 }, { wch: 12 }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Ranked solutions");
+      XLSX.utils.book_append_sheet(wb, ws2, "Weights used");
+      XLSX.writeFile(wb, "ranked_solutions.xlsx");
+    } catch (e) {
+      setExportError("Sorry, the Excel file couldn't be created. Please try again.");
+    }
+  }
+
+  // Image: drawn as SVG, looks like the on-screen table; follows the "Show variables" checkbox
+  const TABLE_MONO = "'Cascadia Code', ui-monospace, monospace";
+  const TABLE_SANS = "-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif";
+  function scenarioTableLayout() {
+    const rows = scenarioTableRows();
+    const vars = showVars ? variables : [];
+    const ctx = document.createElement("canvas").getContext("2d");
+    const measure = (text, font) => { ctx.font = font; return ctx.measureText(String(text)).width; };
+    const cellFont = `11px ${TABLE_MONO}`;
+    const headFont = `600 11px ${TABLE_MONO}`;
+    const nameFont = `600 11px ${TABLE_SANS}`;
+    const noteFont = `600 9px ${TABLE_MONO}`;
+    const padX = 8;
+    const cols = [];
+    cols.push({ kind: "name", head: "Scenario", w: Math.max(measure("Scenario", headFont), ...rows.map((r) => 16 + measure(r.sc.name, nameFont))) + padX * 2 });
+    objectives.forEach((o) => cols.push({ kind: "weight", o, head: labelFor(o), w: Math.max(measure(labelFor(o), headFont), ...rows.map((r) => measure(fmtWeight(r.sc.weights[o] || 0) + "%", cellFont))) + padX * 2 }));
+    cols.push({ kind: "design", head: "Solution #", w: Math.max(measure("Solution #", headFont), ...rows.map((r) => Math.max(
+      measure(r.winner ? r.winner.rowNum : "–", cellFont),
+      r.sameAs ? measure("same as " + r.sameAs, noteFont) : 0,
+      r.ties > 0 ? measure(`tied with ${r.ties} others`, noteFont) : 0,
+    ))) + padX * 2 });
+    objectives.forEach((o) => cols.push({ kind: "value", o, head: labelFor(o), w: Math.max(measure(labelFor(o), headFont), ...rows.map((r) => measure(r.winner ? fmtNum(Number(r.winner.row[o])) : "–", cellFont))) + padX * 2 }));
+    vars.forEach((v) => cols.push({ kind: "var", v, head: labelFor(v), w: Math.max(measure(labelFor(v), headFont), ...rows.map((r) => measure(r.winner ? fmtNum(r.winner.row[v]) : "–", cellFont))) + padX * 2 }));
+    const totalW = cols.reduce((sum, c) => sum + c.w, 0);
+    return { rows, cols, totalW, padX };
+  }
+
+  async function exportScenarioTableImage(format) {
+    setExportError("");
+    try {
+      const { rows, cols, totalW, padX } = scenarioTableLayout();
+      const NS = "http://www.w3.org/2000/svg";
+      const headH1 = 22, headH2 = 24;
+      const rowHeights = rows.map((r) => 24 + (r.sameAs ? 11 : 0) + (r.ties > 0 ? 11 : 0));
+      const H = headH1 + headH2 + rowHeights.reduce((a, b) => a + b, 0);
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("width", totalW); svg.setAttribute("height", H); svg.setAttribute("viewBox", `0 0 ${totalW} ${H}`);
+      const add = (tag, attrs, text) => {
+        const el = document.createElementNS(NS, tag);
+        Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+        if (text !== undefined) el.textContent = text;
+        svg.appendChild(el);
+        return el;
+      };
+      const headBg = "#E6E6E2", weightBg = "#F2F2EF";
+      add("rect", { x: 0, y: 0, width: totalW, height: headH1 + headH2, fill: headBg });
+      // Column x positions
+      let x = 0;
+      cols.forEach((c) => { c.x = x; x += c.w; });
+      const wCols = cols.filter((c) => c.kind === "weight");
+      const winCols = cols.filter((c) => c.kind === "design" || c.kind === "value" || c.kind === "var");
+      const groupLabel = (label, list) => {
+        if (!list.length) return;
+        const x0 = list[0].x, x1 = list[list.length - 1].x + list[list.length - 1].w;
+        add("text", { x: (x0 + x1) / 2, y: 15, "text-anchor": "middle", "font-size": 9.5, "letter-spacing": "0.5", fill: MUTED, "font-family": TABLE_MONO }, label);
+        add("line", { x1: x0 + 4, x2: x1 - 4, y1: headH1 - 1, y2: headH1 - 1, stroke: BORDER, "stroke-width": 1 });
+      };
+      groupLabel("WEIGHTS", wCols);
+      groupLabel("WINNING SOLUTION", winCols);
+      cols.forEach((c) => {
+        const isName = c.kind === "name";
+        add("text", {
+          x: isName ? c.x + padX : c.x + c.w - padX, y: headH1 + 16, "text-anchor": isName ? "start" : "end",
+          "font-size": 11, "font-weight": 600, fill: isName ? MUTED : TEXT, "font-family": isName ? TABLE_SANS : TABLE_MONO,
+        }, c.head);
+      });
+      let y = headH1 + headH2;
+      rows.forEach((r, ri) => {
+        const h = rowHeights[ri];
+        wCols.forEach((c) => add("rect", { x: c.x, y, width: c.w, height: h, fill: weightBg }));
+        add("line", { x1: 0, x2: totalW, y1: y, y2: y, stroke: BORDER, "stroke-width": 1 });
+        const baseY = y + 16;
+        cols.forEach((c) => {
+          if (c.kind === "name") {
+            add("rect", { x: c.x + padX, y: baseY - 9, width: 10, height: 10, rx: 3, fill: r.sc.color });
+            add("text", { x: c.x + padX + 16, y: baseY, "font-size": 11, "font-weight": 600, fill: TEXT, "font-family": TABLE_SANS }, r.sc.name);
+            return;
+          }
+          let text = "–";
+          if (c.kind === "weight") text = fmtWeight(r.sc.weights[c.o] || 0) + "%";
+          else if (r.winner && c.kind === "design") text = String(r.winner.rowNum);
+          else if (r.winner && c.kind === "value") text = fmtNum(Number(r.winner.row[c.o]));
+          else if (r.winner && c.kind === "var") text = fmtNum(r.winner.row[c.v]);
+          add("text", { x: c.x + c.w - padX, y: baseY, "text-anchor": "end", "font-size": 11, fill: TEXT, "font-family": TABLE_MONO }, text);
+          if (c.kind === "design") {
+            let ny = baseY;
+            if (r.sameAs) { ny += 11; add("text", { x: c.x + c.w - padX, y: ny, "text-anchor": "end", "font-size": 9, "font-weight": 600, fill: EMERALD_DARK, "font-family": TABLE_MONO }, "same as " + r.sameAs); }
+            if (r.ties > 0) { ny += 11; add("text", { x: c.x + c.w - padX, y: ny, "text-anchor": "end", "font-size": 9, "font-weight": 600, fill: "#A15C00", "font-family": TABLE_MONO }, `tied with ${r.ties} other${r.ties === 1 ? "" : "s"}`); }
+          }
+        });
+        y += h;
+      });
+      add("rect", { x: 0.5, y: 0.5, width: totalW - 1, height: H - 1, fill: "none", stroke: BORDER, "stroke-width": 1, rx: 6 });
+      // Put it off-screen so it can be measured, then save it like the charts
+      const holder = document.createElement("div");
+      holder.style.cssText = "position:absolute;left:-10000px;top:0;visibility:hidden;";
+      holder.appendChild(svg);
+      document.body.appendChild(holder);
+      await exportSvgElement(svg, { filename: "scenario_comparison", title: "Scenario comparison" }, format);
+      holder.remove();
+    } catch (e) {
+      setExportError("Sorry, the table image couldn't be created. Please try again, or try the other format.");
+    }
+  }
+
+  // Splits a column name into its name and unit, e.g. "Net present cost (CAD)" -> { name: "Net present cost", unit: "CAD" }.
+  // Only parentheses at the very end count as a unit; names without them have no unit.
+  function splitUnit(label) {
+    const m = String(label).match(/^(.*\S)\s*\(([^()]+)\)\s*$/);
+    return m ? { name: m[1], unit: m[2] } : { name: String(label), unit: "" };
+  }
+
+  function labelFor(col) {
+    return (displayNames[col] && displayNames[col].trim()) || col;
+  }
+
+  function rankColor(rank) {
+    if (rank > topN) return "#D5D5D2";
+    return TOP_COLORS[(rank - 1) % TOP_COLORS.length];
+  }
+
+  const hasData = !!rows;
+  const hasObjectives = objectives.length > 0;
+
+  return (
+    <div style={{ background: BG, color: TEXT, minHeight: "100%", fontFamily: "-apple-system,'Segoe UI',Helvetica,Arial,sans-serif", padding: "0", display: "flex", flexDirection: "column" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600;700&display=swap');
+        .mono { font-family: 'Cascadia Code', 'IBM Plex Mono', ui-monospace, monospace; }
+        input[type=range] { -webkit-appearance: none; height: 4px; background: #DADAD7; border-radius: 2px; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: ${EMERALD_DARK}; cursor: pointer; border: none; margin-top: -5px; }
+        input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: ${EMERALD_DARK}; cursor: pointer; border: none; }
+        select { font-family: inherit; }
+        ::-webkit-scrollbar { height: 8px; width: 8px; }
+        ::-webkit-scrollbar-thumb { background: #D5D5D2; border-radius: 4px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { padding: 6px 10px; white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; font-family: 'Cascadia Code', ui-monospace, monospace; font-size: 12.5px; }
+        th:first-child, td:first-child { text-align: left; font-family: inherit; }
+        thead th { position: sticky; top: 0; background: ${PANEL}; border-bottom: 1px solid ${BORDER}; font-weight: 600; color: ${MUTED}; }
+        tbody tr:hover { background: #FAFAF9; }
+        .tab-btn { font-size: 12.5px; font-weight: 600; padding: 6px 14px; border-radius: 6px; border: 1px solid ${BORDER}; background: #fff; color: ${TEXT}; cursor: pointer; }
+        .tab-btn.active { background: ${EMERALD_DARK}; color: #fff; border-color: ${EMERALD_DARK}; }
+        .plain-number::-webkit-inner-spin-button, .plain-number::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+        .plain-number { -moz-appearance: textfield; }
+      `}</style>
+
+      {/* Top bar */}
+      <div style={{ background: "#000", padding: "18px 28px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div className="mono" style={{ color: "#fff", fontWeight: 700, fontSize: 19, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+          Pareto Ranker
+        </div>
+        <div style={{ position: "relative" }}>
+          <button
+            onClick={() => setMenuOpen((v) => !v)}
+            style={{ background: "#1c1c1c", color: "#fff", border: "1px solid #333", borderRadius: 6, padding: "7px 14px", fontSize: 13, cursor: "pointer" }}
+          >
+            Menu ▾
+          </button>
+          {menuOpen && (
+            <div style={{ position: "absolute", top: 40, right: 0, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 8, minWidth: 180, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", padding: 6, zIndex: 20 }}>
+              <a href="index.html#how" style={{ display: "block", padding: "9px 12px", fontSize: 14, color: TEXT, textDecoration: "none", borderRadius: 5 }}>How it works</a>
+              <a href="index.html#contact" style={{ display: "block", padding: "9px 12px", fontSize: 14, color: TEXT, textDecoration: "none", borderRadius: 5 }}>Contact</a>
+              <a href="index.html" style={{ display: "block", padding: "9px 12px", fontSize: 14, color: TEXT, textDecoration: "none", borderRadius: 5 }}>← Back to home</a>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+        {/* Sidebar */}
+        <div style={{ width: 284, borderRight: `1px solid ${BORDER}`, padding: 20, overflowY: "auto", flexShrink: 0 }}>
+          <div style={{ marginBottom: 22 }}>
+            <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>1. GET A SPREADSHEET</div>
+            <div style={{ fontSize: 11.5, color: MUTED, lineHeight: 1.5, marginBottom: 8 }}>
+              Fill in the template with your results, then upload it in step 2. The example shows the format.
+            </div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+              <a href="template.xlsx" download style={{ flex: 1, textAlign: "center", fontSize: 12, fontWeight: 600, color: EMERALD_DARK, background: "#fff", border: `1px solid ${EMERALD_DARK}`, borderRadius: 6, padding: "7px 6px", textDecoration: "none" }}>↓ Download template</a>
+              <a href="sample-data.xlsx" download style={{ flex: 1, textAlign: "center", fontSize: 12, fontWeight: 600, color: EMERALD_DARK, background: "#fff", border: `1px solid ${EMERALD_DARK}`, borderRadius: 6, padding: "7px 6px", textDecoration: "none" }}>↓ Download example</a>
+            </div>
+            <button
+              onClick={openExample}
+              style={{ width: "100%", fontSize: 12, fontWeight: 600, color: "#fff", background: EMERALD_DARK, border: "none", borderRadius: 6, padding: "8px 10px", cursor: "pointer" }}
+            >Open example in the tool</button>
+          </div>
+
+          <div style={{ marginBottom: 22 }}>
+            <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>2. UPLOAD YOUR SPREADSHEET</div>
+            <button
+              onClick={() => fileInputRef.current.click()}
+              style={{
+                width: "100%", padding: "10px 12px", background: PANEL, border: `1px dashed ${BORDER}`,
+                borderRadius: 6, color: TEXT, fontSize: 13, cursor: "pointer",
+              }}
+            >
+              {fileName ? `📄 ${fileName}` : "Upload your spreadsheet (.xlsx or .xls)"}
+            </button>
+            <input ref={fileInputRef} type="file" accept=".xlsx,.xls" onChange={handleFile} style={{ display: "none" }} />
+            {error && <div style={{ color: "#B3261E", fontSize: 12.5, marginTop: 8 }}>{error}</div>}
+            {hasData && (
+              <div style={{ fontSize: 12, color: MUTED, marginTop: 8 }}>{rows.length} solutions loaded, {columns.length} columns found.</div>
+            )}
+          </div>
+
+          {hasData && (
+            <div style={{ marginBottom: 22 }}>
+              <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>3. LABEL YOUR COLUMNS</div>
+              <div style={{ fontSize: 11.5, color: MUTED, lineHeight: 1.5, marginBottom: 10 }}>
+                Mark each column as an objective or a design parameter. For each objective, choose whether it should be minimized or maximized. Set any other column to Ignore.
+              </div>
+
+              <div className="mono" style={{ fontSize: 10.5, color: MUTED, marginBottom: 6, letterSpacing: "0.03em" }}>OBJECTIVES</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16, paddingBottom: 14, borderBottom: `1px solid ${BORDER}` }}>
+                {columns.filter((c) => roles[c] === "min" || roles[c] === "max").length === 0 && (
+                  <div style={{ fontSize: 11.5, color: MUTED, fontStyle: "italic" }}>None yet. Set a column below to an objective (minimize or maximize).</div>
+                )}
+                {columns.filter((c) => roles[c] === "min" || roles[c] === "max").map((c) => (
+                  <div key={c} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 140 }} title={c}>{c}</span>
+                    <select
+                      value={roles[c] || "ignore"}
+                      onChange={(e) => setRole(c, e.target.value)}
+                      style={{
+                        background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4,
+                        fontSize: 11.5, padding: "3px 4px", flexShrink: 0,
+                      }}
+                    >
+                      {Object.entries(ROLE_LABELS).map(([val, label]) => (
+                        <option key={val} value={val}>{label}</option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+
+              <div className="mono" style={{ fontSize: 10.5, color: MUTED, marginBottom: 6, letterSpacing: "0.03em" }}>DESIGN PARAMETERS &amp; OTHER COLUMNS</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {columns.filter((c) => roles[c] !== "min" && roles[c] !== "max").map((c) => (
+                  <div key={c} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 140 }} title={c}>{c}</span>
+                    <select
+                      value={roles[c] || "ignore"}
+                      onChange={(e) => setRole(c, e.target.value)}
+                      style={{
+                        background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4,
+                        fontSize: 11.5, padding: "3px 4px", flexShrink: 0,
+                      }}
+                    >
+                      {Object.entries(ROLE_LABELS).map(([val, label]) => (
+                        <option key={val} value={val}>{label}</option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {hasObjectives && (
+            <div>
+              <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>4. SET YOUR PRIORITIES</div>
+              <div style={{ marginBottom: 16, padding: "10px 12px", border: `1px solid ${BORDER}`, borderRadius: 8, background: PANEL }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+                  <input type="checkbox" checked={liveUpdates} onChange={(e) => setLiveMode(e.target.checked)} />
+                  Live updates
+                </label>
+                <div style={{ fontSize: 10.5, color: MUTED, marginTop: 4, lineHeight: 1.5 }}>
+                  {liveUpdates
+                    ? "Rankings and charts update as you move the sliders."
+                    : "Rankings and charts update only when you click Apply weights. Useful for large files, where live updates can lag."}
+                </div>
+                {autoLiveOff && !liveUpdates && (
+                  <div style={{ fontSize: 10.5, color: EMERALD_DARK, marginTop: 6, lineHeight: 1.5 }}>
+                    Switched off automatically because this file has {rows ? rows.length.toLocaleString() : 0} solutions. You can turn it back on if the tool stays responsive.
+                  </div>
+                )}
+                {!liveUpdates && (() => {
+                  const pending = objectives.some((o) => Math.abs((draftWeights[o] ?? weights[o] ?? 0) - (weights[o] ?? 0)) > 1e-6);
+                  return (
+                    <button
+                      onClick={applyWeights}
+                      disabled={!pending}
+                      style={{
+                        marginTop: 8, width: "100%", fontSize: 12, fontWeight: 600, border: "none", borderRadius: 6, padding: "8px 12px",
+                        color: pending ? "#fff" : MUTED, background: pending ? EMERALD_DARK : "#E9E9E6", cursor: pending ? "pointer" : "default",
+                      }}
+                    >{pending ? "Apply weights" : "✓ Weights applied"}</button>
+                  );
+                })()}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+                {objectives.map((o) => {
+                  const exact = draftWeights[o] ?? weights[o] ?? 0;
+                  const pct = Math.round(exact); // slider moves in whole steps
+                  const shown = fmtWeight(exact);
+                  const isLocked = !!locked[o];
+                  return (
+                    <div key={o}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <input
+                          value={displayNames[o] ?? o}
+                          onChange={(e) => setDisplayNames((prev) => ({ ...prev, [o]: e.target.value }))}
+                          placeholder={o}
+                          style={{
+                            flex: 1, fontSize: 12.5, fontWeight: 600, border: "none", borderBottom: `1px dashed ${BORDER}`,
+                            background: "transparent", color: TEXT, padding: "2px 0", marginBottom: 4,
+                          }}
+                        />
+                        <button
+                          onClick={() => toggleLock(o)}
+                          title={isLocked ? "Unlock this weight" : "Lock this weight in place"}
+                          style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14, padding: "0 2px", opacity: isLocked ? 1 : 0.45, marginBottom: 4 }}
+                        >
+                          {isLocked ? "🔒" : "🔓"}
+                        </button>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4, color: MUTED }}>
+                        <span>{roles[o] === "max" ? "higher is better" : "lower is better"}</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <input
+                          type="range" min={0} max={100} value={pct} disabled={isLocked}
+                          onChange={(e) => draftWeightChange(o, Number(e.target.value))}
+                          style={{ flex: 1 }}
+                        />
+                        <input
+                          type="text" inputMode="decimal" disabled={isLocked}
+                          value={weightTyping && weightTyping.col === o ? weightTyping.text : shown}
+                          onFocus={(e) => { setWeightTyping({ col: o, text: shown }); e.target.select(); }}
+                          onChange={(e) => {
+                            const text = e.target.value.replace(",", ".");
+                            // Allow only numbers with up to one decimal (e.g. "33", "33.", "33.5")
+                            if (!/^\d{0,3}(\.\d?)?$/.test(text)) return;
+                            setWeightTyping({ col: o, text });
+                            // Apply as soon as the number is complete (not empty, not ending in ".")
+                            if (text !== "" && !text.endsWith(".")) {
+                              commitWeight(o, Math.round(Number(text) * 10) / 10);
+                            }
+                          }}
+                          onBlur={() => setWeightTyping(null)}
+                          onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+                          className="mono plain-number"
+                          style={{ width: 46, fontSize: 11.5, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "3px 4px", textAlign: "right", background: isLocked ? PANEL : "#fff", color: isLocked ? MUTED : TEXT }}
+                        />
+                        <span className="mono" style={{ fontSize: 10.5, color: MUTED, width: 14 }}>%</span>
+                      </div>
+                      <div style={{ fontSize: 10, color: MUTED, marginTop: 2 }} className="mono">
+                        = {shown}% of total weight {isLocked && <span style={{ color: EMERALD_DARK, fontWeight: 700 }}>· LOCKED</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10.5, color: MUTED, marginTop: 10, lineHeight: 1.5 }}>
+                Click 🔒 to lock an objective's weight in place. The locked one stays put, and the others adjust to keep the total at 100%.
+              </div>
+
+
+              <div style={{ marginTop: 22, paddingTop: 16, borderTop: `1px solid ${BORDER}` }}>
+                <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>SAVED SCENARIOS</div>
+                {scenarios.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 10 }}>
+                    {scenarios.map((sc) => (
+                      <div key={sc.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, padding: "6px 8px", background: PANEL, borderRadius: 6 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                          <span style={{ width: 9, height: 9, borderRadius: 3, background: sc.color, flexShrink: 0 }} />
+                          <span style={{ fontSize: 12, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={sc.name}>{sc.name}</span>
+                        </div>
+                        <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                          <button
+                            onClick={() => { setWeights({ ...sc.weights }); setDraftWeights({ ...sc.weights }); }}
+                            title="Load these weights into the sliders"
+                            style={{ fontSize: 10.5, fontWeight: 600, color: EMERALD_DARK, background: "none", border: `1px solid ${EMERALD_DARK}`, borderRadius: 4, padding: "2px 7px", cursor: "pointer" }}
+                          >Load</button>
+                          <button
+                            onClick={() => setScenarios((prev) => prev.filter((s) => s.id !== sc.id))}
+                            title="Delete this scenario"
+                            style={{ fontSize: 12, color: MUTED, background: "none", border: "none", cursor: "pointer", padding: "0 4px" }}
+                          >×</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {!showSaveScenario && (
+                  <button
+                    onClick={() => setShowSaveScenario(true)}
+                    disabled={scenarios.length >= 8}
+                    style={{
+                      fontSize: 12, fontWeight: 600, color: scenarios.length >= 8 ? MUTED : "#fff",
+                      background: scenarios.length >= 8 ? PANEL : EMERALD_DARK, border: "none", borderRadius: 6,
+                      padding: "8px 12px", cursor: scenarios.length >= 8 ? "not-allowed" : "pointer", width: "100%",
+                    }}
+                  >
+                    {scenarios.length >= 8 ? "Scenario limit reached (8)" : "+ Save current weights as a scenario"}
+                  </button>
+                )}
+
+                {showSaveScenario && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <input
+                      autoFocus
+                      value={newScenarioName}
+                      onChange={(e) => setNewScenarioName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" && newScenarioName.trim()) saveScenario(); if (e.key === "Escape") { setShowSaveScenario(false); setNewScenarioName(""); } }}
+                      placeholder="Scenario name (e.g. Carbon-priority)"
+                      style={{ fontSize: 12.5, padding: "6px 8px", border: `1px solid ${BORDER}`, borderRadius: 6 }}
+                    />
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button
+                        onClick={() => saveScenario()}
+                        disabled={!newScenarioName.trim()}
+                        style={{ flex: 1, fontSize: 12, fontWeight: 600, color: "#fff", background: newScenarioName.trim() ? EMERALD_DARK : "#B9C4BE", border: "none", borderRadius: 6, padding: "7px 0", cursor: newScenarioName.trim() ? "pointer" : "not-allowed" }}
+                      >Save</button>
+                      <button
+                        onClick={() => { setShowSaveScenario(false); setNewScenarioName(""); }}
+                        style={{ flex: 1, fontSize: 12, fontWeight: 600, color: TEXT, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "7px 0", cursor: "pointer" }}
+                      >Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ marginTop: 22, paddingTop: 16, borderTop: `1px solid ${BORDER}` }}>
+                <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>HIGHLIGHT TOP SOLUTIONS</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 12.5 }}>Highlight top</span>
+                  <input
+                    type="number" min={1} max={results ? results.length : 50} value={topNDraft}
+                    onChange={(e) => setTopNDraft(e.target.value)}
+                    onFocus={(e) => e.target.select()}
+                    onBlur={(e) => commitTopN(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { commitTopN(e.target.value); e.target.blur(); } }}
+                    className="mono plain-number"
+                    style={{ width: 50, fontSize: 12, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "3px 4px", textAlign: "center" }}
+                  />
+                  <span style={{ fontSize: 12.5 }}>solutions in the charts</span>
+                </div>
+                <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>Press Enter or click away to apply.</div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Main */}
+        <div style={{ flex: 1, overflow: "auto", padding: 24, minWidth: 0 }}>
+          {!hasData && (
+            <div style={{ color: MUTED, fontSize: 14, marginTop: 60, textAlign: "center" }}>
+              Upload a spreadsheet to get started.
+            </div>
+          )}
+
+          {hasData && !hasObjectives && (
+            <div style={{ color: MUTED, fontSize: 14, marginTop: 60, textAlign: "center" }}>
+              Pick at least one column as an objective in the sidebar to see rankings.
+            </div>
+          )}
+
+          {hasObjectives && results && (
+            <>
+              {demoMode && (
+                <div style={{ marginBottom: 14, padding: "10px 14px", borderRadius: 8, border: `1px solid ${EMERALD}`, background: "#EEF6F2", fontSize: 12.5, color: TEXT, lineHeight: 1.5 }}>
+                  <strong>You're viewing sample data:</strong> {rows ? rows.length : 168} Pareto-optimal retrofit solutions for a mid-rise office building in Ottawa, Canada (about 4,982 m²), optimized for net lifecycle carbon, net present cost, and thermal resilience.
+                </div>
+              )}
+              {exportError && (
+                <div style={{ marginBottom: 12, padding: "8px 12px", borderRadius: 8, border: "1px solid #E7B4B4", background: "#FDF1F1", fontSize: 12.5, color: "#8A2A2A" }}>{exportError}</div>
+              )}
+              {!liveUpdates && objectives.some((o) => Math.abs((draftWeights[o] ?? weights[o] ?? 0) - (weights[o] ?? 0)) > 1e-6) && (
+                <div style={{ marginBottom: 16, padding: "10px 14px", borderRadius: 8, border: "1px solid #E3C77A", background: "#FFF8E5", fontSize: 12.5, color: "#6B4E00", lineHeight: 1.5 }}>
+                  <strong>Weights changed.</strong> The rankings and charts below still use the previous weights. Click "Apply weights" in the left panel to update them.
+                </div>
+              )}
+              {(
+                <div style={{ marginBottom: 24 }}>
+                  <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>Trade-off view</div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      {objectives.length >= 2 && (
+                        <button className={`tab-btn ${chartView === "scatter" ? "active" : ""}`} onClick={() => setChartView("scatter")}>2D scatter</button>
+                      )}
+                      {objectives.length + variables.length >= 2 && (
+                        <button className={`tab-btn ${chartView === "parallel" ? "active" : ""}`} onClick={() => setChartView("parallel")}>Parallel coordinates</button>
+                      )}
+                      {variables.length > 0 && (
+                        <button className={`tab-btn ${chartView === "histograms" ? "active" : ""}`} onClick={() => setChartView("histograms")}>Design parameter histograms</button>
+                      )}
+                      <button className={`tab-btn ${chartView === "scenarios" ? "active" : ""}`} onClick={() => setChartView("scenarios")}>Scenarios</button>
+                    </div>
+                    {chartView === "scatter" && (
+                      <div style={{ display: "flex", gap: 8, fontSize: 12, color: MUTED, alignItems: "center" }}>
+                        X:
+                        <select value={xCol} onChange={(e) => setXCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                          {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                        </select>
+                        Y:
+                        <select value={yCol} onChange={(e) => setYCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                          {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                        </select>
+                      </div>
+                    )}
+                  </div>
+
+                  {chartView === "scatter" && (
+                    <>
+                      <div ref={scatterContainerRef} style={{ position: "relative", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "38px", height: scatterHeight, boxSizing: "border-box", overflow: "hidden" }}>
+                        {chartData && (() => {
+                          const { W, H } = scatDims("scatter", Math.max(200, scatterWidth), Math.max(150, scatterHeight - 76));
+                          let marginRight = 10; const marginTop = 10, marginBottom = 37; // bottom: X numbers, then the X title, with little empty space under it
+                          const plotH = H - marginTop - marginBottom;
+                          const yTickCount = Math.max(3, Math.round(plotH / 45));
+                          const yAxis = niceTicksN(chartData.yMin, chartData.yMax, yTickCount);
+                          // Left margin fits the widest Y-axis number, keeping the Y title 0.5 cm (19 px at 96 px per inch) away from the numbers
+                          const yTickW = Math.max(...yAxis.ticks.map((t) => textWidth(fmtShort(t), "9.5px 'Cascadia Code', ui-monospace, monospace")));
+                          const Y_TITLE_X = 16;          // baseline of the rotated Y title
+                          const Y_TITLE_EDGE = Y_TITLE_X + 2.2; // right edge of the rotated title's letters (measured in a browser)
+                          const marginLeft = Math.ceil(Y_TITLE_EDGE + 19 + yTickW + 6);
+                          let plotW = W - marginLeft - marginRight;
+                          const xTickCount = Math.max(3, Math.round(plotW / 70));
+                          const xAxis = niceTicksN(chartData.xMin, chartData.xMax, xTickCount);
+                          // The last X-axis number is centred on the right edge of the plot; leave room for its right half so it isn't cut off
+                          marginRight = Math.max(10, Math.ceil(textWidth(fmtShort(xAxis.ticks[xAxis.ticks.length - 1]), "9.5px 'Cascadia Code', ui-monospace, monospace") / 2) + 4);
+                          plotW = W - marginLeft - marginRight;
+                          const xToPx = (v) => marginLeft + ((v - xAxis.min) / (xAxis.max - xAxis.min || 1)) * plotW;
+                          const yToPy = (v) => marginTop + (1 - (v - yAxis.min) / (yAxis.max - yAxis.min || 1)) * plotH;
+                          const yTitleMidY = marginTop + plotH / 2;
+                          return (
+                            <svg data-export="scatter" width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+                              {yAxis.ticks.map((t, i) => (
+                                <line key={"hy" + i} x1={marginLeft} x2={marginLeft + plotW} y1={yToPy(t)} y2={yToPy(t)} stroke="#E9E9E6" strokeWidth="1" />
+                              ))}
+                              {xAxis.ticks.map((t, i) => (
+                                <line key={"vx" + i} x1={xToPx(t)} x2={xToPx(t)} y1={marginTop} y2={marginTop + plotH} stroke="#E9E9E6" strokeWidth="1" />
+                              ))}
+                              {yAxis.ticks.map((t, i) => (
+                                <text key={"yl" + i} x={marginLeft - 6} y={yToPy(t) + 3} textAnchor="end" fontSize="9.5" fill={MUTED} className="mono">{fmtShort(t)}</text>
+                              ))}
+                              {xAxis.ticks.map((t, i) => (
+                                <text key={"xl" + i} x={xToPx(t)} y={marginTop + plotH + 13} textAnchor="middle" fontSize="9.5" fill={MUTED} className="mono">{fmtShort(t)}</text>
+                              ))}
+                              <text x={marginLeft + plotW / 2} y={marginTop + plotH + 32} textAnchor="middle" fontSize={axisTitleSize(labelFor(xCol), W - 8)} fontWeight="600" fill={TEXT}>{labelFor(xCol)}</text>
+                              <text x={Y_TITLE_X} y={yTitleMidY} textAnchor="middle" fontSize={axisTitleSize(labelFor(yCol), plotH + marginTop + 10)} fontWeight="600" fill={TEXT} transform={`rotate(-90 ${Y_TITLE_X} ${yTitleMidY})`}>{labelFor(yCol)}</text>
+                              {results.map((r, i) => {
+                                const xv = Number(r.row[xCol]);
+                                const yv = Number(r.row[yCol]);
+                                const px = xToPx(xv);
+                                const py = yToPy(yv);
+                                const isTop = r.rank <= topN;
+                                const color = rankColor(r.rank);
+                                return (
+                                  <circle
+                                    key={i} cx={px} cy={py} r={isTop ? 5.5 : 3.5}
+                                    fill={color}
+                                    stroke={isTop ? "#000" : "none"} strokeWidth={isTop ? 1.2 : 0}
+                                    opacity={isTop ? 1 : 0.7}
+                                    onMouseEnter={() => setHoverPoint(r)}
+                                    onMouseLeave={() => setHoverPoint(null)}
+                                    style={{ cursor: "pointer" }}
+                                  />
+                                );
+                              })}
+                            </svg>
+                          );
+                        })()}
+                        <div
+                          onMouseDown={startScatterResize}
+                          title="Drag to resize"
+                          style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 12, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center" }}
+                        >
+                          <div style={{ width: 34, height: 4, borderRadius: 2, background: "#C7C7C3" }} />
+                        </div>
+                        {hoverPoint && (
+                          <div className="mono" style={{ position: "absolute", top: 8, right: 16, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 11.5 }}>
+                            <div>Rank #{hoverPoint.rank} · score {hoverPoint.score.toFixed(3)}</div>
+                            <div>{labelFor(xCol)}: {fmtNum(Number(hoverPoint.row[xCol]))}</div>
+                            <div>{labelFor(yCol)}: {fmtNum(Number(hoverPoint.row[yCol]))}</div>
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginTop: 6 }}>
+                        <div style={{ fontSize: 11, color: MUTED }}>The top {topN} solutions are highlighted in color (see the ranked table for which color is which rank); the rest of the solutions are displayed in faint grey.</div>
+                        <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexShrink: 0 }}>{scatSizeControl()}{dlButtons("scatter", scatExportMeta({ filename: "scatter_" + labelFor(yCol) + "_vs_" + labelFor(xCol) }))}</span>
+                      </div>
+                    </>
+                  )}
+
+                  {chartView === "parallel" && objectives.length + variables.length >= 2 && (
+                    <>
+                      {pcChecklist()}
+                      {pcShownColumns().length < 2 ? (
+                        <div style={{ border: `1px dashed ${BORDER}`, borderRadius: 8, padding: "30px 20px", textAlign: "center", fontSize: 13, color: MUTED, background: PANEL }}>
+                          Tick at least two objectives or design parameters above to draw the plot.
+                        </div>
+                      ) : (
+                        <div ref={parallelContainerRef} style={{ position: "relative", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, height: parallelHeight, overflow: "hidden" }}>
+                          {renderPcSvg("parallel", pcWidthFor("parallel", Math.max(300, parallelWidth)), pcHeightFor("parallel", Math.max(250, parallelHeight - 14)), "main")}
+                          <div
+                            onMouseDown={startParallelResize}
+                            title="Drag to resize"
+                            style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 12, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center" }}
+                          >
+                            <div style={{ width: 34, height: 4, borderRadius: 2, background: "#C7C7C3" }} />
+                          </div>
+                          {hoverLine && (
+                            <div className="mono" style={{ position: "absolute", top: 8, right: 16, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 11.5, maxWidth: 320 }}>
+                              <div style={{ fontWeight: 700 }}>Rank #{hoverLine.rank} · score {hoverLine.score.toFixed(3)}</div>
+                              {pcHoverValues(hoverLine.row)}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginTop: 6, marginBottom: 2, flexWrap: "wrap" }}>
+                        {pcSizeControl()}
+                        {dlButtons("parallel", pcExportMeta("parallel_coordinates"))}
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 2, lineHeight: 1.5 }}>
+                        Each line is one solution, running through its design parameters (left) and the results they lead to (the objectives, in green, on the right). Objective axes are oriented so "better" is always at the top; design parameter axes run from the lowest value (bottom) to the highest (top). The top {topN} solutions are highlighted in color (see the ranked table for which color is which rank); the rest of the solutions are displayed in faint grey.
+                      </div>
+                    </>
+                  )}
+
+                  {chartView === "histograms" && (
+                    <>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16 }}>
+                        {variables.map((v) => {
+                          const { bins, topMarkers } = getVariableHistogram(v);
+                          const markerBins = bins.map((_, i) => [...topMarkers[i]].sort((x, y) => x - y).map((rank) => ({ color: rankColor(rank), shape: "dot", title: `Rank #${rank}` })));
+                          return (
+                            <div key={v} style={{ background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "12px 12px 10px" }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, marginBottom: 10 }}>
+                                <div style={{ fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={labelFor(v)}>{labelFor(v)}</div>
+                                {dlButtons("hist-" + v, { filename: "histogram_" + labelFor(v), title: labelFor(v) })}
+                              </div>
+                              <MeasuredWidth>{(w) => renderHistSvg("hist-" + v, v, markerBins, w)}</MeasuredWidth>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 10 }}>Each bar shows how many of your {results.length} solutions share that value (or fall in that range). The colored dots above a bar mark where your top {topN} solutions land (see the ranked table for which color is which rank). Hover over a dot to see its rank, or over a bar for its exact count.</div>
+                    </>
+                  )}
+
+                  {chartView === "scenarios" && scenarios.length === 0 && (
+                    <div style={{ border: `1px dashed ${BORDER}`, borderRadius: 8, padding: "36px 24px", textAlign: "center", background: PANEL }}>
+                      <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>No scenarios yet</div>
+                      <div style={{ fontSize: 13, color: MUTED, lineHeight: 1.55, maxWidth: 460, margin: "0 auto 18px" }}>
+                        A scenario saves one set of priority weights under a name, so you can compare which solution wins under different priorities.
+                        Set your weights in the left panel, then save them here or with "Save current weights as a scenario" in the left panel.
+                      </div>
+                      {!showTabSave && (
+                        <button
+                          onClick={() => setShowTabSave(true)}
+                          style={{ fontSize: 12.5, fontWeight: 600, color: "#fff", background: EMERALD_DARK, border: "none", borderRadius: 6, padding: "9px 16px", cursor: "pointer" }}
+                        >+ Save current weights as a scenario</button>
+                      )}
+                      {showTabSave && (
+                        <div style={{ display: "flex", gap: 6, justifyContent: "center", flexWrap: "wrap", maxWidth: 460, margin: "0 auto" }}>
+                          <input
+                            autoFocus
+                            value={tabScenarioName}
+                            onChange={(e) => setTabScenarioName(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter" && tabScenarioName.trim()) saveScenario(tabScenarioName); if (e.key === "Escape") { setShowTabSave(false); setTabScenarioName(""); } }}
+                            placeholder="Scenario name (e.g. Carbon-priority)"
+                            style={{ flex: "1 1 200px", fontSize: 12.5, padding: "7px 9px", border: `1px solid ${BORDER}`, borderRadius: 6 }}
+                          />
+                          <button
+                            onClick={() => saveScenario(tabScenarioName)}
+                            disabled={!tabScenarioName.trim()}
+                            style={{ fontSize: 12, fontWeight: 600, color: "#fff", background: tabScenarioName.trim() ? EMERALD_DARK : "#B9C4BE", border: "none", borderRadius: 6, padding: "7px 14px", cursor: tabScenarioName.trim() ? "pointer" : "not-allowed" }}
+                          >Save</button>
+                          <button
+                            onClick={() => { setShowTabSave(false); setTabScenarioName(""); }}
+                            style={{ fontSize: 12, fontWeight: 600, color: TEXT, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "7px 14px", cursor: "pointer" }}
+                          >Cancel</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {chartView === "scenarios" && scenarios.length > 0 && (
+                    <>
+              {(() => {
+                // For each scenario: its #1 design, and how many other designs share exactly the same score
+                const rowsInfo = scenarios.map((sc) => {
+                  const res = computeResultsForWeights(sc.weights);
+                  const winner = res && res[0];
+                  const ties = winner ? res.filter((r) => Math.abs(r.score - winner.score) < 1e-9).length - 1 : 0;
+                  return { sc, winner, ties };
+                });
+                const firstWithSame = (info, idx) => {
+                  if (!info.winner) return null;
+                  const earlier = rowsInfo.slice(0, idx).find((o) => o.winner && o.winner.rowNum === info.winner.rowNum);
+                  return earlier ? earlier.sc.name : null;
+                };
+                const headBg = "#E6E6E2";   // darker grey for this table's whole header
+                const weightBg = "#F2F2EF"; // light grey behind the weight cells
+                const groupTh = { background: headBg, textAlign: "center", fontSize: 10.5, letterSpacing: "0.03em", textTransform: "uppercase", color: MUTED, borderBottom: `1px solid ${BORDER}` };
+                return (
+                  <>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>Scenario comparison ({scenarios.length})</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                        {variables.length > 0 && (
+                          <label style={{ fontSize: 12, color: MUTED, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                            <input type="checkbox" checked={showVars} onChange={(e) => setShowVars(e.target.checked)} />
+                            Show design parameters
+                          </label>
+                        )}
+                        {(() => {
+                          const btn = { fontSize: 10, fontWeight: 600, color: MUTED, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 6px", cursor: "pointer", lineHeight: 1.5 };
+                          return (
+                            <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+                              <button style={btn} title="Download as an Excel file with every column, including all design parameters" onClick={exportScenarioExcel}>↓ Excel</button>
+                              <button style={btn} title="Download the table as a PNG image, 6.5 inches wide (follows Show design parameters)" onClick={() => exportScenarioTableImage("png")}>↓ PNG</button>
+                              <button style={btn} title="Download the table as an SVG (follows Show design parameters)" onClick={() => exportScenarioTableImage("svg")}>↓ SVG</button>
+                            </span>
+                          );
+                        })()}
+                      </div>
+                    </div>
+                    <div style={{ border: `1px solid ${BORDER}`, borderRadius: 8, overflow: "auto", maxHeight: 480 }}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th rowSpan={2} style={{ verticalAlign: "bottom", background: headBg }}>Scenario</th>
+                            <th colSpan={objectives.length} style={groupTh}>Weights</th>
+                            <th colSpan={1 + objectives.length + (showVars ? variables.length : 0)} style={groupTh}>Winning solution</th>
+                          </tr>
+                          <tr>
+                            {objectives.map((o) => <th key={"w" + o} style={{ background: headBg, textAlign: "right", fontFamily: "'Cascadia Code', ui-monospace, monospace" }}>{labelFor(o)}</th>)}
+                            <th style={{ background: headBg }}>Solution #</th>
+                            {objectives.map((o) => <th key={"v" + o} style={{ background: headBg }}>{labelFor(o)}</th>)}
+                            {showVars && variables.map((v) => <th key={v} style={{ background: headBg }}>{labelFor(v)}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rowsInfo.map((info, idx) => {
+                            const sameAs = firstWithSame(info, idx);
+                            return (
+                              <tr key={info.sc.id}>
+                                <td style={{ textAlign: "left", whiteSpace: "nowrap" }}>
+                                  <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 3, background: info.sc.color, marginRight: 7, verticalAlign: "middle" }} />
+                                  <span style={{ fontWeight: 600 }}>{info.sc.name}</span>
+                                </td>
+                                {objectives.map((o) => <td key={"w" + o} style={{ background: weightBg }}>{fmtWeight(info.sc.weights[o] || 0)}%</td>)}
+                                <td style={{ whiteSpace: "nowrap" }}>
+                                  {info.winner ? info.winner.rowNum : "–"}
+                                  {sameAs && <div style={{ fontSize: 10, color: EMERALD_DARK, fontWeight: 600 }}>same as {sameAs}</div>}
+                                  {info.ties > 0 && <div style={{ fontSize: 10, color: "#A15C00", fontWeight: 600 }}>tied with {info.ties} other{info.ties === 1 ? "" : "s"}</div>}
+                                </td>
+                                {objectives.map((o) => <td key={"v" + o}>{info.winner ? fmtNum(Number(info.winner.row[o])) : "–"}</td>)}
+                                {showVars && variables.map((v) => <td key={v}>{info.winner ? fmtNum(info.winner.row[v]) : "–"}</td>)}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div style={{ fontSize: 11, color: MUTED, marginTop: 8, marginBottom: 28, lineHeight: 1.5 }}>
+                      Weights are the ones saved with each scenario, not the current sliders. "Solution #" is the solution's position in your file (1 = the first data row). "Tied" means other solutions got exactly the same score. The tool lists the one that comes first in your file as #1, but the tied solutions are equally good.
+                    </div>
+                  </>
+                );
+              })()}
+                      {objectives.length >= 2 && (
+                        <div style={{ marginBottom: 28 }}>
+                          <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+                            <div style={{ fontSize: 13, fontWeight: 700 }}>Where each scenario's pick sits overall</div>
+                            <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 8 }}>{scatSizeControl()}{dlButtons("scen-scatter", scatExportMeta({
+                              filename: "scenario_winners_scatter_" + labelFor(scenYCol) + "_vs_" + labelFor(scenXCol),
+                              legend: scenarios.map((sc) => ({ color: sc.color, label: sc.name })),
+                            }))}</span>
+                            <div style={{ display: "flex", gap: 8, fontSize: 12, color: MUTED, alignItems: "center" }}>
+                              X:
+                              <select value={scenXCol} onChange={(e) => setScenXCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                                {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                              </select>
+                              Y:
+                              <select value={scenYCol} onChange={(e) => setScenYCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                                {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                              </select>
+                            </div>
+                          </div>
+                          <div ref={scenScatterContainerRef} style={{ position: "relative", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "38px", height: scenScatterHeight, boxSizing: "border-box", overflow: "hidden" }}>
+                            {(() => {
+                              const allX = results.map((r) => Number(r.row[scenXCol]));
+                              const allY = results.map((r) => Number(r.row[scenYCol]));
+                              const xMin = Math.min(...allX), xMax = Math.max(...allX);
+                              const yMin = Math.min(...allY), yMax = Math.max(...allY);
+                              const { W, H } = scatDims("scen-scatter", Math.max(200, scenScatterWidth), Math.max(150, scenScatterHeight - 76));
+                              let marginRight = 10; const marginTop = 10, marginBottom = 37; // bottom: X numbers, then the X title, with little empty space under it
+                              const plotH = H - marginTop - marginBottom;
+                              const yTickCount = Math.max(3, Math.round(plotH / 45));
+                              const yAxis = niceTicksN(yMin, yMax, yTickCount);
+                              // Left margin fits the widest Y-axis number, keeping the Y title 0.5 cm (19 px at 96 px per inch) away from the numbers
+                              const yTickW = Math.max(...yAxis.ticks.map((t) => textWidth(fmtShort(t), "9.5px 'Cascadia Code', ui-monospace, monospace")));
+                              const Y_TITLE_X = 16;          // baseline of the rotated Y title
+                              const Y_TITLE_EDGE = Y_TITLE_X + 2.2; // right edge of the rotated title's letters (measured in a browser)
+                              const marginLeft = Math.ceil(Y_TITLE_EDGE + 19 + yTickW + 6);
+                              let plotW = W - marginLeft - marginRight;
+                              const xTickCount = Math.max(3, Math.round(plotW / 70));
+                              const xAxis = niceTicksN(xMin, xMax, xTickCount);
+                              // The last X-axis number is centred on the right edge of the plot; leave room for its right half so it isn't cut off
+                              marginRight = Math.max(10, Math.ceil(textWidth(fmtShort(xAxis.ticks[xAxis.ticks.length - 1]), "9.5px 'Cascadia Code', ui-monospace, monospace") / 2) + 4);
+                              plotW = W - marginLeft - marginRight;
+                              const xToPx = (v) => marginLeft + ((v - xAxis.min) / (xAxis.max - xAxis.min || 1)) * plotW;
+                              const yToPy = (v) => marginTop + (1 - (v - yAxis.min) / (yAxis.max - yAxis.min || 1)) * plotH;
+                              const yTitleMidY = marginTop + plotH / 2;
+                              const scenPoints = scenarios.map((sc) => {
+                                const scResults = computeResultsForWeights(sc.weights);
+                                const winner = scResults && scResults[0];
+                                return winner ? { scenario: sc, xv: Number(winner.row[scenXCol]), yv: Number(winner.row[scenYCol]) } : null;
+                              }).filter(Boolean);
+                              return (
+                                <svg data-export="scen-scatter" width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+                                  {yAxis.ticks.map((t, i) => (<line key={"hy"+i} x1={marginLeft} x2={marginLeft+plotW} y1={yToPy(t)} y2={yToPy(t)} stroke="#E9E9E6" strokeWidth="1" />))}
+                                  {xAxis.ticks.map((t, i) => (<line key={"vx"+i} x1={xToPx(t)} x2={xToPx(t)} y1={marginTop} y2={marginTop+plotH} stroke="#E9E9E6" strokeWidth="1" />))}
+                                  {yAxis.ticks.map((t, i) => (<text key={"yl"+i} x={marginLeft-6} y={yToPy(t)+3} textAnchor="end" fontSize="9.5" fill={MUTED} className="mono">{fmtShort(t)}</text>))}
+                                  {xAxis.ticks.map((t, i) => (<text key={"xl"+i} x={xToPx(t)} y={marginTop+plotH+13} textAnchor="middle" fontSize="9.5" fill={MUTED} className="mono">{fmtShort(t)}</text>))}
+                                  <text x={marginLeft+plotW/2} y={marginTop+plotH+32} textAnchor="middle" fontSize={axisTitleSize(labelFor(scenXCol), W - 8)} fontWeight="600" fill={TEXT}>{labelFor(scenXCol)}</text>
+                                  <text x={Y_TITLE_X} y={yTitleMidY} textAnchor="middle" fontSize={axisTitleSize(labelFor(scenYCol), plotH + marginTop + 10)} fontWeight="600" fill={TEXT} transform={`rotate(-90 ${Y_TITLE_X} ${yTitleMidY})`}>{labelFor(scenYCol)}</text>
+                                  {results.map((r, i) => (
+                                    <circle key={i} cx={xToPx(Number(r.row[scenXCol]))} cy={yToPy(Number(r.row[scenYCol]))} r={3} fill="#D5D5D2" opacity={0.6} />
+                                  ))}
+                                  {scenPoints.map((p) => (
+                                    <circle
+                                      key={p.scenario.id} cx={xToPx(p.xv)} cy={yToPy(p.yv)} r={7}
+                                      fill={p.scenario.color} stroke="#000" strokeWidth="1.2"
+                                      onMouseEnter={() => setHoverScenPoint(p)}
+                                      onMouseLeave={() => setHoverScenPoint(null)}
+                                      style={{ cursor: "pointer" }}
+                                    />
+                                  ))}
+                                </svg>
+                              );
+                            })()}
+                            <div
+                              onMouseDown={startScenScatterResize}
+                              title="Drag to resize"
+                              style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 12, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center" }}
+                            >
+                              <div style={{ width: 34, height: 4, borderRadius: 2, background: "#C7C7C3" }} />
+                            </div>
+                            {hoverScenPoint && (
+                              <div className="mono" style={{ position: "absolute", top: 8, right: 16, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 11.5 }}>
+                                <div style={{ fontWeight: 700 }}>{hoverScenPoint.scenario.name}</div>
+                                <div>{labelFor(scenXCol)}: {fmtNum(hoverScenPoint.xv)}</div>
+                                <div>{labelFor(scenYCol)}: {fmtNum(hoverScenPoint.yv)}</div>
+                              </div>
+                            )}
+                          </div>
+                          <div style={{ fontSize: 11, color: MUTED, marginTop: 6 }}>Each scenario's winning solution is highlighted in color (see the comparison table above for which color is which scenario); the rest of the solutions are displayed in faint grey.</div>
+                        </div>
+                      )}
+
+                      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>Comparing each scenario's winning solution</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                        {objectives.map((o) => {
+                          const winners = scenarios.map((sc) => {
+                            const scResults = computeResultsForWeights(sc.weights);
+                            const winner = scResults && scResults[0];
+                            return { scenario: sc, value: winner ? Number(winner.row[o]) : 0 };
+                          });
+                          const values = winners.map((w) => w.value);
+                          let rangeMin = Math.min(0, ...values);
+                          let rangeMax = Math.max(0, ...values);
+                          if (rangeMin === rangeMax) { rangeMin -= 1; rangeMax += 1; }
+                          // Horizontal bars: one row per scenario, name written above its bar, bars grow right (positive) or left (negative) from zero
+                          const n = winners.length;
+                          // Fixed width: the whole card is 624 px = 6.5 inches at 96 px per inch,
+                          // the text width of a letter-size page with 1-inch margins. Shrinks only if the screen is narrower.
+                          const CARD_W = 624;
+                          const W = exportTarget === "scen-bar-" + o ? EXPORT_W : Math.max(260, Math.min(CARD_W, Math.floor(scenPcWidth)) - 26);
+                          const rowH = 46, nameH = 15, barH = 20, topPad = 6, bottomPad = 6;
+                          const H = topPad + n * rowH + bottomPad;
+                          // Each value goes INSIDE its bar when it fits; otherwise just outside the bar's end.
+                          // Numbers are measured first, so outside numbers always get exactly the room they need.
+                          const NUM_FONT = "600 11px 'Cascadia Code', ui-monospace, monospace";
+                          const numW = winners.map((w) => textWidth(fmtNum(w.value), NUM_FONT));
+                          // Inside a bar, the number is black text placed insidePad + labelPadX from the bar's end
+                          const insidePad = 4, outsideGap = 6, labelPadX = 3;
+                          let needPos = 0, needNeg = 0;
+                          // About 1 cm (38 px at 96 px per inch) of empty space on each side of the bars
+                          const SIDE_PAD = 38;
+                          let plotLeft = SIDE_PAD, plotRight = W - SIDE_PAD, xOf, zeroX, inside = [];
+                          for (let pass = 0; pass < 4; pass++) {
+                            plotLeft = SIDE_PAD + needNeg;
+                            plotRight = W - SIDE_PAD - needPos;
+                            const pl = plotLeft, pr = plotRight;
+                            xOf = (v) => pl + ((v - rangeMin) / (rangeMax - rangeMin)) * (pr - pl);
+                            zeroX = xOf(0);
+                            inside = winners.map((w, i) => Math.abs(xOf(w.value) - zeroX) >= numW[i] + labelPadX * 2 + insidePad * 2);
+                            let np = 0, nn = 0;
+                            winners.forEach((w, i) => {
+                              if (inside[i]) return;
+                              if (w.value >= 0) np = Math.max(np, numW[i] + outsideGap + 2);
+                              else nn = Math.max(nn, numW[i] + outsideGap + 2);
+                            });
+                            if (np === needPos && nn === needNeg) break;
+                            needPos = np; needNeg = nn;
+                          }
+                          return (
+                            <div key={o} style={{ width: W + 26, maxWidth: "100%", boxSizing: "border-box", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "12px 12px 10px" }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                                <div style={{ fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={labelFor(o)}>{labelFor(o)}</div>
+                                {dlButtons("scen-bar-" + o, { filename: "scenario_winners_" + labelFor(o), title: labelFor(o) })}
+                              </div>
+                              <svg data-export={"scen-bar-" + o} width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+                                <line x1={zeroX} x2={zeroX} y1={topPad} y2={H - bottomPad} stroke="#C7C7C3" strokeWidth="1" />
+                                {winners.map((w, i) => {
+                                  const rowTop = topPad + i * rowH;
+                                  const barY = rowTop + nameH + 3;
+                                  const xVal = xOf(w.value);
+                                  const barX = Math.min(xVal, zeroX);
+                                  const barW = Math.max(2, Math.abs(xVal - zeroX));
+                                  const isPos = w.value >= 0;
+                                  const numInside = inside[i];
+                                  const numX = numInside
+                                    ? (isPos ? barX + barW - insidePad - labelPadX : barX + insidePad + labelPadX)
+                                    : (isPos ? barX + barW + outsideGap : barX - outsideGap);
+                                  const numAnchor = numInside ? (isPos ? "end" : "start") : (isPos ? "start" : "end");
+                                  const name = w.scenario.name;
+                                  // Name sits above the bar, starting at the zero line on the side the bar grows.
+                                  // If it doesn't fit there, it goes on the other side of the zero line instead of being cut short.
+                                  const NAME_FONT = "11px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif";
+                                  const nameW = textWidth(name, NAME_FONT);
+                                  const roomRight = W - 8 - (zeroX + 2);
+                                  const roomLeft = (zeroX - 2) - 8;
+                                  const ownRoom = isPos ? roomRight : roomLeft;
+                                  const otherRoom = isPos ? roomLeft : roomRight;
+                                  const nameOnRight = ownRoom >= nameW ? isPos : (otherRoom > ownRoom ? !isPos : isPos);
+                                  const nameX = nameOnRight ? zeroX + 2 : zeroX - 2;
+                                  const room = nameOnRight ? roomRight : roomLeft;
+                                  let labelText = name;
+                                  if (nameW > room) {
+                                    // Still too long on either side: shorten with "…"
+                                    let cut = name.length;
+                                    while (cut > 1 && textWidth(name.slice(0, cut) + "…", NAME_FONT) > room) cut--;
+                                    labelText = name.slice(0, cut) + "…";
+                                  }
+                                  return (
+                                    <g key={w.scenario.id}>
+                                      <text x={nameX} y={rowTop + nameH - 2} textAnchor={nameOnRight ? "start" : "end"} fontSize="11" fontWeight="400" fill={TEXT}><title>{name}</title>{labelText}</text>
+                                      <rect x={barX} y={barY} width={barW} height={barH} fill={w.scenario.color} rx="2" />
+                                      <text x={numX} y={barY + barH / 2 + 4} textAnchor={numAnchor} fontSize="11" fontWeight="600" fill="#111111" className="mono">{fmtNum(w.value)}</text>
+                                    </g>
+                                  );
+                                })}
+                              </svg>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 14, marginBottom: 8 }}>Each chart shows the winning solution's value for one objective, compared across your saved scenarios.</div>
+
+                      {objectives.length + variables.length >= 2 && (() => {
+                        const lines = getScenarioLines();
+                        const legend = lines.winnerLines.map((l) => ({ colors: l.scens.map((sc) => sc.color), label: l.scens.map((sc) => sc.name).join(" + ") + " (solution " + l.result.rowNum + ")" }));
+                        const totalTies = lines.perScen.reduce((sum, p) => sum + p.ties.length, 0);
+                        return (
+                          <div style={{ marginTop: 18, marginBottom: 8 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+                              <div style={{ fontSize: 13, fontWeight: 700 }}>Each scenario's winner across design parameters and objectives</div>
+                              <span style={{ display: "inline-flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                                {pcSizeControl()}
+                                {dlButtons("scen-pc", pcExportMeta("scenario_winners_parallel_coordinates", { legend }))}
+                              </span>
+                            </div>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 16px", fontSize: 12, marginBottom: 8 }}>
+                              {lines.winnerLines.map((l) => (
+                                <span key={l.result.rowNum} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                                  {l.scens.map((sc) => <span key={sc.id} style={{ width: 10, height: 10, borderRadius: 3, background: sc.color, display: "inline-block" }} />)}
+                                  <span>{l.scens.map((sc) => sc.name).join(" + ")}</span>
+                                  <span style={{ color: MUTED }}>(solution {l.result.rowNum})</span>
+                                </span>
+                              ))}
+                            </div>
+                            {pcChecklist()}
+                            {pcShownColumns().length < 2 ? (
+                              <div style={{ border: `1px dashed ${BORDER}`, borderRadius: 8, padding: "26px 20px", textAlign: "center", fontSize: 13, color: MUTED, background: PANEL }}>
+                                Tick at least two objectives or design parameters above to draw the plot.
+                              </div>
+                            ) : (
+                              <div ref={scenPcContainerRef} style={{ position: "relative", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, overflow: "hidden" }}>
+                                {renderPcSvg("scen-pc", pcWidthFor("scen-pc", Math.max(300, scenPcWidth)), pcHeightFor("scen-pc", 400), "scen", lines)}
+                                {hoverScenLine && (
+                                  <div className="mono" style={{ position: "absolute", top: 8, right: 16, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 11.5, maxWidth: 320 }}>
+                                    {hoverScenLine.kind === "winner" ? (
+                                      <div style={{ fontWeight: 700 }}>Winner of {hoverScenLine.scens.map((sc) => sc.name).join(" + ")} · solution {hoverScenLine.result.rowNum}</div>
+                                    ) : (
+                                      <div style={{ fontWeight: 700 }}>
+                                        Solution {hoverScenLine.result.rowNum}: tied with {hoverScenLine.scen.name}'s winner (solution {hoverScenLine.winnerRow})
+                                        {hoverScenLine.identical && <span style={{ fontWeight: 400 }}> · identical results</span>}
+                                      </div>
+                                    )}
+                                    {pcHoverValues(hoverScenLine.result.row)}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                            <div style={{ fontSize: 11, color: MUTED, marginTop: 6, lineHeight: 1.5 }}>
+                              Each bold line is one scenario's winning solution, in that scenario's color, running through its design parameters (left) and objectives (green, right). The axes shown are the same as in the Parallel coordinates tab.
+                              {totalTies > 0 && " Faded lines are solutions tied with a winner (exactly the same score), in a lighter version of that scenario's color."}
+                              {lines.winnerLines.some((l) => l.scens.length > 1) && " A dashed line with two or more colors means those scenarios picked the same solution."}
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {variables.length > 0 && (() => {
+                        const { perScen, winnerLines } = getScenarioLines();
+                        const tiesFor = (sc) => { const p = perScen.find((x) => x.sc.id === sc.id); return p ? p.ties.length : 0; };
+                        return (
+                          <div style={{ marginTop: 22, marginBottom: 8 }}>
+                            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>Each scenario's winner: design parameter histograms</div>
+                            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16 }}>
+                              {variables.map((v) => {
+                                const { bins } = getVariableHistogram(v);
+                                // Which bar each winner falls in (one square per scenario, in its color)
+                                const markerBins = bins.map(() => []);
+                                winnerLines.forEach((l) => {
+                                  const idx = bins.findIndex((b) => b.test(Number(l.result.row[v])));
+                                  if (idx >= 0) l.scens.forEach((sc) => {
+                                    const t = tiesFor(sc);
+                                    markerBins[idx].push({ color: sc.color, shape: "square", title: `${sc.name}'s winner (solution ${l.result.rowNum}): ${fmtNum(l.result.row[v])}${t > 0 ? ` · tied with ${t} other${t === 1 ? "" : "s"}` : ""}` });
+                                  });
+                                });
+                                return (
+                                  <div key={v} style={{ background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "12px 12px 10px" }}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, marginBottom: 10 }}>
+                                      <div style={{ fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={labelFor(v)}>{labelFor(v)}</div>
+                                      {dlButtons("scen-hist-" + v, {
+                                        filename: "scenario_winners_histogram_" + labelFor(v),
+                                        title: labelFor(v),
+                                        legend: scenarios.map((sc) => ({ color: sc.color, label: sc.name })),
+                                      })}
+                                    </div>
+                                    <MeasuredWidth>{(w) => renderHistSvg("scen-hist-" + v, v, markerBins, w)}</MeasuredWidth>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            <div style={{ fontSize: 11, color: MUTED, marginTop: 10, lineHeight: 1.5 }}>
+                              Each bar shows how many of your {results.length} solutions share that value (or fall in that range). The colored squares above a bar mark where each scenario's winning solution lands (see the comparison table above for which color is which scenario). Hover over a square for the scenario, solution number and any ties, or over a bar for its exact count.
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </>
+                  )}
+                </div>
+              )}
+
+
+              {chartView !== "scenarios" && (
+              <>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, marginTop: 28 }}>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>Ranked solutions ({results.length})</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  {variables.length > 0 && (
+                    <label style={{ fontSize: 12, color: MUTED, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                      <input type="checkbox" checked={showVars} onChange={(e) => setShowVars(e.target.checked)} />
+                      Show design parameters
+                    </label>
+                  )}
+                  <button
+                    onClick={exportRankedExcel}
+                    title="Download every solution with its rank, score, objectives and all design parameters, plus the weights used"
+                    style={{ fontSize: 10, fontWeight: 600, color: MUTED, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 4, padding: "1px 6px", cursor: "pointer", lineHeight: 1.5 }}
+                  >↓ Excel</button>
+                </div>
+              </div>
+              <div style={{ border: `1px solid ${BORDER}`, borderRadius: 8, overflow: "auto", maxHeight: 480 }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Rank</th>
+                      <th>Score</th>
+                      {objectives.map((o) => <th key={o}>{labelFor(o)}</th>)}
+                      {showVars && variables.map((v) => <th key={v}>{labelFor(v)}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map((r) => (
+                      <tr key={r.rank} style={{ background: r.rank <= topN ? "rgba(11,110,79,0.04)" : "transparent" }}>
+                        <td>
+                          {r.rank <= topN ? (
+                            <span className="mono" style={{
+                              display: "inline-flex", alignItems: "center", justifyContent: "center",
+                              width: 24, height: 24, borderRadius: "50%", background: rankColor(r.rank),
+                              color: "#fff", fontWeight: 700, fontSize: 12,
+                            }}>{r.rank}</span>
+                          ) : (
+                            <span style={{ paddingLeft: 3 }}>{r.rank}</span>
+                          )}
+                        </td>
+                        <td>{r.score.toFixed(3)}</td>
+                        {objectives.map((o) => <td key={o}>{fmtNum(Number(r.row[o]))}</td>)}
+                        {showVars && variables.map((v) => <td key={v}>{fmtNum(r.row[v])}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              </>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<ParetoRanker />);
+</script>
+</body>
+</html>
